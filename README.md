@@ -10,3 +10,6 @@
 3.提交与合并 开发完成后 Push，并在 GitHub 创建 **Pull Request (PR)**，队长 Code Review 通过后合并至 `dev` 分支。
 
 4.提交信息规范 `git commit -m "feat: 完成图纸切片预处理模块"` 或 `fix: 修复正则匹配bug`
+
+
+有不会或不知道的可以查文档，问ai。推荐使用Gemini，Qwen，Chatgpt，Cloude code。资料可以去csdn上找
