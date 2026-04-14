@@ -212,7 +212,7 @@ if 'drawing_data' in st.session_state and 'images' in st.session_state:
     if dims.get('other_dimensions'):
         st.caption(f"其他尺寸备注: {dims['other_dimensions']}")
 
-    # 公差信息（可折叠）
+    # 公差信息
     if tolerances:
         with st.expander("🔧 尺寸公差"):
             df_tol = pd.DataFrame(tolerances)
@@ -236,7 +236,7 @@ if 'drawing_data' in st.session_state and 'images' in st.session_state:
     st.divider()
     st.subheader("📄 图纸页面浏览与批注")
 
-    # 初始化批注字典（如果之前没有）
+    # 初始化批注字典
     if "annotations" not in st.session_state:
         st.session_state["annotations"] = {}
 
