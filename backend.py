@@ -417,7 +417,13 @@ config = BackendConfig()
 config.load()
 oss = OSSOperation()
 oss.initBucket(config)
-oss.testBucket()
+
+try:
+    oss.testBucket()
+except Exception as e:
+    Logger.error("无法连接到 OSS 存储桶，程序无法继续运行!")
+    exit(1)
+
 conversations = ConvStore()
 conversations.loadFromFile()
 openai_impl = OpenAIImpl(config)
@@ -518,7 +524,6 @@ def f_get_conversation_info(conv_uuid):
         part_drawing_json = f.read()
     part_drawing = PartDrawing.from_json(part_drawing_json)
     return jsonify(part_drawing.to_dict())
-
 
 if __name__ == "__main__":
     app.run(debug=True)
