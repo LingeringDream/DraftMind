@@ -14,7 +14,7 @@ from openai import OpenAI
 
 # 从配置文件 main_prompt.md 中读取 Prompt
 def loadPrompts():
-    with open("main_prompt.md", "r") as f:
+    with open("main_prompt.md", "r", encoding="utf-8") as f:
         return f.read()
 _MainPrompt = loadPrompts()
 
@@ -80,6 +80,9 @@ class OSSOperation:
             raise ValueError("在存储桶还未初始化时就调用")
         return self.bucket
     def testBucket(self):
+        """
+        测试是否能连接到配置的 OSS 存储桶。
+        """
         try:
             self.getBucket().get_bucket_info()
             Logger.info("成功连接到 OSS 存储桶")
@@ -105,7 +108,7 @@ class OSSOperation:
         :return: 该图像的URL。
         """
         if isinstance(content, str):
-            with open(content, "rb") as f:
+            with open(content, "rb", encoding="utf-8") as f:
                 content = f.read()
         elif hasattr(content, "read"):
             content = content.read()
@@ -121,6 +124,9 @@ class OSSOperation:
         path = f"{convID}/{fileID}.jpg"
         self.getBucket().put_object(path, content)
         return "https://draftmind.oss-cn-beijing.aliyuncs.com" + "/" + path
+
+# -------------------------------------------
+# 下列代码定义的是 AI 识别出来的图纸信息
 
 @dataclass
 class BasicInfo:
@@ -272,14 +278,21 @@ class PartDrawing:
     def to_json(self, ensure_ascii: bool = False, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=ensure_ascii, indent=indent)
     
+# -------------------------------------------
+    
 @dataclass
 class DraftInformation:
+    # 图纸标题
     title: str = ""
     # 图纸编号（通常在标题栏右下角）
     draft_number: str = ""
     pass
 
 class AIConversation:
+    """
+    本 class 内定义了一个单独的 AI 上下文
+    即从一开始上传图纸、生成信息、到用户询问聊天记录的所有信息
+    """
     # 被保护的上下文，通常是和图片文件有关的上下文，dict 列表
     main_contents = []
     # 用户对图片询问的上下文
@@ -316,6 +329,9 @@ class AIConversation:
         return conv
     
 class ConvStore:
+    """
+    本 class 代表了所有上下文的存储器，负责将所有聊天记录序列化和保存到文件中。
+    """
     conversations: dict[str, AIConversation] = dict()
     uuid_to_title: dict[str, str] = dict()
     def getConversationOf(self, uuid: str):
@@ -434,7 +450,7 @@ def f_new_conversation():
     """
     新建一个对话，要求附带图纸的图片 (JPG 格式)。
     后端将向 AI 模型发送该图纸图片，并从模型返回的对话上下文中提取图纸信息（如标题、格式等）
-    存储该对话上下文，并返回一个 UUID 以供后续查询。
+    存储该对话上下文，并返回该对话的 UUID 以供后续查询。
     """
     if "image" not in request.files:
         return jsonify({"error": "没有上传图纸图片"}), 400
@@ -498,7 +514,7 @@ def f_get_conversation_info(conv_uuid):
     json_path = os.path.join(drawing_data_path, f"{conv_uuid}.json")
     if not os.path.exists(json_path):
         return jsonify({"error": "指定 UUID 的图纸信息不存在"}), 404
-    with open(json_path, "r") as f:
+    with open(json_path, "r", encoding="utf-8") as f:
         part_drawing_json = f.read()
     part_drawing = PartDrawing.from_json(part_drawing_json)
     return jsonify(part_drawing.to_dict())
