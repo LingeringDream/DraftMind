@@ -1,0 +1,17 @@
+# 避免将 venv 提交至 git
+venv/
+# 避免将苹果电脑内部文件提交至 git
+.DS_*
+# 测试用例
+tests/
+# 数据文件
+conversations/
+drawing_data/
+__pycache__/
+*.pyc
+文档
+技术路线
+实现流程
+计划.xlsx
+#避免泄露敏感信息
+.env
