@@ -121,6 +121,21 @@ def main():
             "package.json was not found. Run 'npm install' first."
         )
 
+    # --- 自动安装前端依赖 ---
+    # 如果 node_modules 目录不存在，自动执行 npm install
+    node_modules = os.path.join(os.getcwd(), "node_modules")
+    if not os.path.isdir(node_modules):
+        print("[0/2] Installing frontend dependencies (npm install) ...")
+        install_proc = subprocess.run(
+            [npm_exe, "install"],
+            cwd=os.getcwd(),
+            shell=(platform.system() == "Windows"),
+        )
+        if install_proc.returncode != 0:
+            print("[ERROR] npm install failed. Please run 'npm install' manually.")
+            sys.exit(1)
+        print("  Frontend dependencies installed.")
+
     backend_proc = None
     frontend_proc = None
 
