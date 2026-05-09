@@ -94,19 +94,63 @@ if os.path.exists(PROMPT_PATH):
         SYSTEM_PROMPT = f.read()
 
 # ================================================================
+# 数据持久化目录
+# ================================================================
+# 解析结果保存为本地 JSON 文件，重启后自动加载
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def save_conversation_to_disk(conv_uuid: str, data: dict):
+    """将单条图纸解析结果持久化到 data/ 目录"""
+    try:
+        filepath = os.path.join(DATA_DIR, f"{conv_uuid}.json")
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Data] 保存失败: {e}")
+
+
+def load_conversations_from_disk() -> Dict[str, dict]:
+    """启动时从 data/ 目录加载所有历史解析结果"""
+    loaded = {}
+    if not os.path.isdir(DATA_DIR):
+        return loaded
+    for fname in os.listdir(DATA_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            filepath = os.path.join(DATA_DIR, fname)
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            conv_uuid = fname.replace(".json", "")
+            loaded[conv_uuid] = data
+        except Exception as e:
+            print(f"[Data] 加载 {fname} 失败: {e}")
+    print(f"[Data] 已加载 {len(loaded)} 条历史记录")
+    return loaded
+
+
+# ================================================================
 # 内存数据存储
 # ================================================================
-# 注意：生产环境应替换为数据库（如 PostgreSQL / MongoDB）
-# 当前使用内存字典存储，重启后数据丢失
 
-# 图纸会话数据: conv_uuid -> 图纸完整信息
-conversations: Dict[str, dict] = {}
+# 图纸会话数据: conv_uuid -> 图纸完整信息（启动时从磁盘加载）
+conversations: Dict[str, dict] = load_conversations_from_disk()
 
 # 异步任务数据: job_id -> 任务状态信息
 jobs: Dict[str, dict] = {}
 
-# 知识库条目: conv_uuid -> {info, embedding, oss_url}
+# 知识库条目: conv_uuid -> {info, embedding, image_urls}
 knowledge_base: Dict[str, dict] = {}
+
+# 启动时将已加载的历史数据同步到知识库（用于相似推荐/搜索）
+for _cid, _cdata in conversations.items():
+    knowledge_base[_cid] = {
+        "info": _cdata.get("info", {}),
+        "embedding": None,  # 历史数据的嵌入需重新生成
+        "image_urls": _cdata.get("image_urls", []),
+    }
 
 # ================================================================
 # 异步任务执行器
@@ -673,13 +717,16 @@ def run_parse_job(job_id: str, conv_uuid: str, image_bytes_list: List[bytes],
         jobs[job_id]["progress"] = "正在保存解析结果..."
         jobs[job_id]["progress_pct"] = 0.95
 
-        conversations[conv_uuid] = {
+        conv_data = {
             "info": parsed_info,           # 结构化解析数据
             "image_urls": image_urls,      # [OSS] 图片存储地址（本地路径或 OSS URL）
             "image_count": len(image_bytes_list),
             "created_at": time.time(),
             "title": parsed_info.get("basic_info", {}).get("part_name", ""),
         }
+        conversations[conv_uuid] = conv_data
+        # 持久化到本地 JSON 文件，重启后可恢复
+        save_conversation_to_disk(conv_uuid, conv_data)
 
         # 将解析结果加入知识库（用于相似推荐和搜索）
         knowledge_base[conv_uuid] = {

@@ -18,6 +18,10 @@ build/
 *.tmp
 .DS_Store
 
+# 运行时数据（本地存储的解析结果和上传图片）
+data/
+uploads/
+
 # IDE
 .vscode/
 .idea/
