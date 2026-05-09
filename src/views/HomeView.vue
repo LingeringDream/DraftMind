@@ -125,11 +125,16 @@ const uploadAndParse = async () => {
       continue
     }
   }
-  // 解析第一个上传的图纸
-  const firstKey = Object.keys(store.drawings)[0]
-  if (firstKey) {
-    await store.submitParseJob(firstKey, 0, uploadToOss.value)  // [OSS] 传递存储选项
-    ElMessage.success('已提交解析任务，请稍后查看进度')
+  // 并行提交所有图纸的解析任务
+  const allKeys = Object.keys(store.drawings)
+  const submitResults = await Promise.all(
+    allKeys.map((key, idx) => store.submitParseJob(key, idx, uploadToOss.value))
+  )
+  const successCount = submitResults.filter(Boolean).length
+  if (successCount > 0) {
+    ElMessage.success(`已提交 ${successCount} 个解析任务，请查看进度`)
+  } else {
+    ElMessage.error('所有任务提交失败')
   }
   showUploadDialog.value = false
   fileList.value = []
