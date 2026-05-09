@@ -5,3 +5,5 @@ oss2>=2.18
 python-dotenv>=1.0
 numpy>=1.24
 Pillow>=10.0
+ezdxf>=1.0          # [CAD] DXF 文件解析库
+matplotlib>=3.8     # [CAD] DXF 渲染为图片
