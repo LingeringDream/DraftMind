@@ -1,17 +1,29 @@
-# 避免将 venv 提交至 git
-venv/
-# 避免将苹果电脑内部文件提交至 git
-.DS_*
-# 测试用例
-tests/
-# 数据文件
-conversations/
-drawing_data/
-__pycache__/
-*.pyc
-文档
-技术路线
-实现流程
-计划.xlsx
-#避免泄露敏感信息
+﻿# 依赖
+node_modules/
+package-lock.json   
+
+# 构建产物
+dist/
+build/
+.vite/
+
+# 环境变量
 .env
+.env.local
+.env.*.local
+.venv
+
+# 日志和临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 运行时数据（本地存储的解析结果和上传图片）
+data/
+uploads/
+
+# IDE
+.vscode/
+.idea/
+
+public/pdf.worker.min.js  

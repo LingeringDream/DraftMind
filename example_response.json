@@ -1,0 +1,105 @@
+{
+  "basic_info": {
+    "part_name": "传动轴",
+    "part_name_x": 12.5,
+    "part_name_y": 6.3,
+    "drawing_number": "DM-2026-A001",
+    "drawing_number_x": 78.0,
+    "drawing_number_y": 4.8,
+    "material": "45# 钢",
+    "surface_treatment": "发黑处理"
+  },
+  "dimensions": {
+    "length": 280.0,
+    "length_x": 50.0,
+    "length_y": 88.5,
+    "width": 45.0,
+    "width_x": 92.0,
+    "width_y": 50.0,
+    "height_thickness": 45.0,
+    "height_x": 8.0,
+    "height_y": 55.0,
+    "other_dimensions": "键槽 14×5.5（深），轴肩间距 60mm"
+  },
+  "tolerances": [
+    {
+      "dimension_name": "轴径 φ45",
+      "basic_size": 45.0,
+      "upper_deviation": 0.0,
+      "lower_deviation": -0.025,
+      "tolerance_code": "h7",
+      "x": 72.0,
+      "y": 38.5
+    },
+    {
+      "dimension_name": "轴径 φ35",
+      "basic_size": 35.0,
+      "upper_deviation": 0.0,
+      "lower_deviation": -0.016,
+      "tolerance_code": "h6",
+      "x": 42.0,
+      "y": 38.5
+    },
+    {
+      "dimension_name": "总长",
+      "basic_size": 280.0,
+      "upper_deviation": 0.2,
+      "lower_deviation": -0.2,
+      "tolerance_code": "js12",
+      "x": 50.0,
+      "y": 92.0
+    }
+  ],
+  "geometric_tolerances": [
+    {
+      "item": "圆跳动",
+      "value": 0.02,
+      "x": 72.0,
+      "y": 48.0
+    },
+    {
+      "item": "同轴度",
+      "value": 0.015,
+      "x": 42.0,
+      "y": 48.0
+    },
+    {
+      "item": "圆柱度",
+      "value": 0.01,
+      "x": 58.0,
+      "y": 72.0
+    }
+  ],
+  "surface_roughness": [
+    {
+      "surface_location": "φ45 轴承配合面",
+      "value": 0.8,
+      "x": 75.0,
+      "y": 32.0
+    },
+    {
+      "surface_location": "φ35 密封面",
+      "value": 1.6,
+      "x": 38.0,
+      "y": 32.0
+    },
+    {
+      "surface_location": "轴肩端面",
+      "value": 3.2,
+      "x": 58.0,
+      "y": 60.0
+    },
+    {
+      "surface_location": "键槽侧面",
+      "value": 3.2,
+      "x": 55.0,
+      "y": 75.0
+    }
+  ],
+  "technical_requirements": [
+    "未注倒角 C1",
+    "去毛刺",
+    "调质处理 HB 220-250",
+    "φ45 轴径处淬火 HRC 48-52"
+  ]
+}

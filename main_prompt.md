@@ -15,7 +15,27 @@
 
 ---
 
-## 二、提取规则
+## 二、坐标标注规则（必须遵守）
+
+为支持前端 SVG 图纸叠加标注，**每个标注元素都必须输出其在图纸上的位置坐标**。
+
+坐标以图像百分比表示：
+- `x`：水平位置，`0` = 最左边，`100` = 最右边
+- `y`：垂直位置，`0` = 最上边，`100` = 最下边
+- 坐标应指向该标注文字或符号在图纸上的**中心位置**
+- 精度保留一位小数即可（如 `65.3`）
+- 如果图纸上某个字段找不到对应标注文字，坐标填 `-1`
+
+坐标字段分布：
+- `basic_info` 中：`part_name_x`、`part_name_y`、`drawing_number_x`、`drawing_number_y`
+- `dimensions` 中：`length_x`、`length_y`、`width_x`、`width_y`、`height_x`、`height_y`
+- `tolerances[]` 每项中：`x`、`y`
+- `geometric_tolerances[]` 每项中：`x`、`y`
+- `surface_roughness[]` 每项中：`x`、`y`
+
+---
+
+## 三、提取规则
 
 ### A. 数值字段（严格强制）
 
@@ -52,10 +72,11 @@
 12. `dimensions.other_dimensions`：无备注信息时填 JSON `null`
 13. `tolerance_code`：有公差代号（如 h7、H8、f6、k6）时填对应字符串；
     无公差代号时填 JSON `null`（注意：是 `null`，不是字符串 `"null"` 或 `"无"`）
+14. 无法定位的坐标字段统一填 `-1`（如 `x: -1, y: -1` 表示未定位）
 
 ---
 
-## 三、输出 JSON Schema
+## 四、输出 JSON Schema
 
 以下 JSON 中的值为格式示例，请全部替换为从图纸实际提取的数据：
 
@@ -63,14 +84,24 @@
 {
   "basic_info": {
     "part_name": "轴承座",
+    "part_name_x": 15.2,
+    "part_name_y": 8.3,
     "drawing_number": "DWG-2024-001",
+    "drawing_number_x": 75.0,
+    "drawing_number_y": 5.1,
     "material": "45 优质碳素结构钢",
     "surface_treatment": "发黑处理"
   },
   "dimensions": {
     "length": 120.0,
+    "length_x": 60.0,
+    "length_y": 92.5,
     "width": 80.0,
+    "width_x": 95.0,
+    "width_y": 50.0,
     "height_thickness": 50.0,
+    "height_x": 30.0,
+    "height_y": 75.0,
     "other_dimensions": "倒角C2，圆角R5"
   },
   "tolerances": [
@@ -79,23 +110,31 @@
       "basic_size": 30.0,
       "tolerance_code": "H7",
       "upper_deviation": 0.021,
-      "lower_deviation": 0.0
+      "lower_deviation": 0.0,
+      "x": 65.3,
+      "y": 42.1
     }
   ],
   "geometric_tolerances": [
     {
       "item": "同轴度",
-      "value": 0.02
+      "value": 0.02,
+      "x": 45.0,
+      "y": 60.0
     }
   ],
   "surface_roughness": [
     {
       "surface_location": "轴孔内壁",
-      "value": 1.6
+      "value": 1.6,
+      "x": 70.0,
+      "y": 35.0
     },
     {
       "surface_location": "非配合面",
-      "value": 6.3
+      "value": 6.3,
+      "x": 20.0,
+      "y": 55.0
     }
   ],
   "technical_requirements": [
@@ -108,7 +147,7 @@
 
 ---
 
-## 四、最终输出要求
+## 五、最终输出要求
 
 - **只输出 JSON 对象本身**，不得包含任何解释、说明文字或 Markdown 代码块标记
 - 不得在 JSON 前后添加任何文字

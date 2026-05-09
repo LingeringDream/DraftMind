@@ -1,1206 +1,1372 @@
-from __future__ import annotations
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+DraftMind Flask 后端服务
+========================
+
+本文件是 DraftMind 工程图纸智能管理系统的后端 API 服务。
+基于 Flask 框架提供 RESTful API，供 Vue.js 前端调用。
+
+主要功能：
+  - 图纸上传与异步解析（调用通义千问多模态大模型）
+  - 合规性审查（基于国标 + 自定义规则）
+  - 相似图纸推荐（向量嵌入 + 混合相似度）
+  - 语义搜索（关键词匹配知识库）
+  - 图纸知识问答（基于解析上下文的 RAG）
+
+技术栈：
+  - Flask + flask-cors 提供 HTTP API
+  - 阿里云 OSS 存储图纸原图
+  - 通义千问 (qwen3-vl-32b-thinking) 进行图纸解析
+  - text-embedding-v3 生成向量嵌入
+  - ThreadPoolExecutor 管理异步任务队列
+"""
 
 import base64
+import io
 import json
 import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict, field
-from datetime import datetime
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import oss2
+import requests
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
-from openai import OpenAI, BadRequestError
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from PIL import Image
 
+# [CAD] CAD 文件解析依赖（延迟导入，未安装时不影响图片/PDF 功能）
+try:
+    import ezdxf
+    import matplotlib
+    matplotlib.use("Agg")  # 无 GUI 后端，服务器环境适用
+    import matplotlib.pyplot as plt
+    CAD_SUPPORT = True
+except ImportError:
+    CAD_SUPPORT = False
 
 # ================================================================
-# 审图 Prompt 模板
+# 环境变量加载
 # ================================================================
-
-_REVIEW_PROMPT_TEMPLATE = """\
-你是一名资深机械设计工程师，精通《机械设计手册》、GB/T 4458 系列制图国标及相关行业标准。
-请对以下图纸结构化数据进行全面合规性审查，并以 JSON 格式输出审查报告。
-
-## 审查维度
-1. 尺寸标注完整性：长/宽/高是否缺失（数值为 0 视为缺失）；关键配合尺寸是否标注公差
-2. 公差合理性：是否符合 GB/T 1800 标准等级；上下偏差符号是否正确；尺寸链是否闭合
-3. 材料选型合理性：材料牌号与零件功能、载荷、使用环境的匹配度
-4. 表面处理适配性：工艺与材料兼容性；粗糙度值与配合面功能需求的对应关系
-5. 形位公差规范性：基准选取合理性；公差值松紧是否适当
-6. 技术要求完整性：关键加工要求、热处理要求、检验要求是否遗漏
-{CUSTOM_RULES_SECTION}
-## 待审图纸结构化数据
-{DRAWING_JSON}
-
-## 输出要求
-只输出以下结构的 JSON 对象，不添加任何其他文字或代码块标记。
-字段说明：
-- overall_pass: boolean，无 ERROR 级问题时为 true，有 ERROR 时为 false
-- risk_level: "LOW"（无ERROR）/"MEDIUM"（有WARNING无ERROR）/"HIGH"（有ERROR）
-- issues: 数组，每项含 category/severity/description/suggestion/reference
-  - category 可选值: 尺寸标注、公差、材料、表面处理、形位公差、技术要求
-  - severity 可选值: ERROR（必须修改）、WARNING（建议修改）、INFO（参考建议）
-  - description: 具体问题描述
-  - suggestion: 具体修改建议
-  - reference: 参考标准，如 GB/T 4458.4-2003，无则填空字符串
-- summary: 总体评价字符串，100 字以内
-"""
-
+# 从 .env 文件读取配置（API 密钥、OSS 配置等）
+load_dotenv()
 
 # ================================================================
-# 加载主 Prompt
+# Flask 应用初始化
 # ================================================================
-
-def _load_main_prompt() -> str:
-    with open("main_prompt.md", "r", encoding="utf-8") as f:
-        return f.read()
-
-_MAIN_PROMPT: str = _load_main_prompt()
-
+app = Flask(__name__)
+# 允许跨域请求（Vue.js 前端运行在 localhost:5173，后端在 localhost:5000）
+CORS(app)
 
 # ================================================================
-# Logger
+# 全局配置
 # ================================================================
 
-class Logger:
-    @staticmethod
-    def _log(level: str, message: str) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] [{level}] {message}")
+# --- 通义千问 API 配置 ---
+# 使用 OpenAI 兼容接口调用阿里云通义千问模型
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3-vl-32b-thinking")            # 多模态视觉模型，用于图纸解析
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-v3")  # 文本嵌入模型
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "8021"))
 
-    @classmethod
-    def info(cls, message: str) -> None:
-        cls._log("INFO", message)
+# --- [OSS] 本地存储配置（默认存储位置） ---
+# 图片默认保存在项目根目录的 uploads/ 文件夹下
+LOCAL_STORAGE_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
 
-    @classmethod
-    def warning(cls, message: str) -> None:
-        cls._log("WARNING", message)
+# --- 阿里云 OSS 配置（可选，用户主动开启时使用） ---
+OSS_ENDPOINT = os.getenv("OSS_ENDPOINT", "")
+OSS_ACCESS_KEY = os.getenv("OSS_ACCESS_KEY", "")
+OSS_ACCESS_SECRET = os.getenv("OSS_ACCESS_SECRET", "")
+OSS_BUCKET_NAME = os.getenv("OSS_BUCKET_NAME", "")
 
-    @classmethod
-    def error(cls, message: str) -> None:
-        cls._log("ERROR", message)
+# --- 解析提示词 ---
+# 从 main_prompt.md 加载图纸解析的 system prompt
+PROMPT_PATH = os.path.join(os.path.dirname(__file__), "main_prompt.md")
+SYSTEM_PROMPT = ""
+if os.path.exists(PROMPT_PATH):
+    with open(PROMPT_PATH, "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read()
+
+# ================================================================
+# 数据持久化目录
+# ================================================================
+# 解析结果保存为本地 JSON 文件，重启后自动加载
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def save_conversation_to_disk(conv_uuid: str, data: dict):
+    """将单条图纸解析结果持久化到 data/ 目录"""
+    try:
+        filepath = os.path.join(DATA_DIR, f"{conv_uuid}.json")
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Data] 保存失败: {e}")
+
+
+def load_conversations_from_disk() -> Dict[str, dict]:
+    """启动时从 data/ 目录加载所有历史解析结果"""
+    loaded = {}
+    if not os.path.isdir(DATA_DIR):
+        return loaded
+    for fname in os.listdir(DATA_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            filepath = os.path.join(DATA_DIR, fname)
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            conv_uuid = fname.replace(".json", "")
+            loaded[conv_uuid] = data
+        except Exception as e:
+            print(f"[Data] 加载 {fname} 失败: {e}")
+    print(f"[Data] 已加载 {len(loaded)} 条历史记录")
+    return loaded
 
 
 # ================================================================
-# 后端配置
+# 内存数据存储
 # ================================================================
 
-class BackendConfig:
-    _REQUIRED: List[str] = [
-        "OSS_ENDPOINT", "OSS_ACCESS_KEY", "OSS_ACCESS_SECRET", "OSS_BUCKET_NAME",
-        "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_MODEL", "OPENAI_MAX_TOKENS",
-    ]
-    _OPTIONAL: Dict[str, str] = {
-        # DashScope OpenAI-compatible mode supports text embedding models like:
-        # - text-embedding-v3 / text-embedding-v4
-        # While OpenAI official endpoints use text-embedding-3-*
-        "OPENAI_EMBEDDING_MODEL": "text-embedding-v3",
+# 图纸会话数据: conv_uuid -> 图纸完整信息（启动时从磁盘加载）
+conversations: Dict[str, dict] = load_conversations_from_disk()
+
+# 异步任务数据: job_id -> 任务状态信息
+jobs: Dict[str, dict] = {}
+
+# 知识库条目: conv_uuid -> {info, embedding, image_urls}
+knowledge_base: Dict[str, dict] = {}
+
+# 启动时将已加载的历史数据同步到知识库（用于相似推荐/搜索）
+for _cid, _cdata in conversations.items():
+    knowledge_base[_cid] = {
+        "info": _cdata.get("info", {}),
+        "embedding": None,  # 历史数据的嵌入需重新生成
+        "image_urls": _cdata.get("image_urls", []),
     }
 
-    def __init__(self) -> None:
-        for key in self._REQUIRED:
-            setattr(self, key, "")
-        for key, default in self._OPTIONAL.items():
-            setattr(self, key, default)
-
-    @staticmethod
-    def _normalize_api_base(url: str) -> str:
-        normalized = url.strip().rstrip("/")
-        for suffix in ("/chat/completions", "/responses", "/completions"):
-            if normalized.endswith(suffix):
-                return normalized[: -len(suffix)]
-        return normalized
-
-    def load(self) -> None:
-        Logger.info("从 .env 文件加载环境变量...")
-        load_dotenv()
-        missing = 0
-        for key in self._REQUIRED:
-            if key in os.environ:
-                value = os.environ[key]
-                if key == "OPENAI_API_BASE":
-                    value = self._normalize_api_base(value)
-                setattr(self, key, value)
-                Logger.info(f"  [OK] {key} = {value}")
-            else:
-                Logger.error(f"  [MISSING] 必需变量 {key} 未设置!")
-                missing += 1
-        for key, default in self._OPTIONAL.items():
-            if key in os.environ:
-                setattr(self, key, os.environ[key])
-                Logger.info(f"  [OK] {key} = {os.environ[key]}")
-            else:
-                Logger.info(f"  [DEFAULT] {key} = {default}")
-        if missing:
-            Logger.error(f"{missing} 个必需环境变量未设置，即将退出")
-            exit(1)
-
-
 # ================================================================
-# 图像工具函数（优化核心）
+# 异步任务执行器
 # ================================================================
-
-def compress_image(content: bytes, max_size: int = 1920, quality: int = 85) -> bytes:
-    """
-    压缩图像以减少上传大小和 LLM token 消耗。
-    - 限制最长边不超过 max_size 像素
-    - 使用 JPEG 格式，quality=85 在清晰度和体积间取得平衡
-    """
-    img = Image.open(BytesIO(content))
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
-    w, h = img.size
-    if max(w, h) > max_size:
-        scale = max_size / max(w, h)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        Logger.info(f"图像已缩放: {w}x{h} -> {new_w}x{new_h}")
-
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
-    compressed = buf.getvalue()
-    Logger.info(
-        f"图像压缩完成: {len(content) / 1024:.1f}KB -> {len(compressed) / 1024:.1f}KB"
-    )
-    return compressed
-
-
-def image_to_base64_url(content: bytes) -> str:
-    """
-    将图像字节转为 data URL，可直接传入 OpenAI vision API。
-    跳过 OSS 上传等待，大幅减少 LLM 调用前的等待时间。
-    """
-    b64 = base64.b64encode(content).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-# ================================================================
-# OSS 操作
-# ================================================================
-
-class OSSOperation:
-    def __init__(self) -> None:
-        self._bucket: Optional[oss2.Bucket] = None
-
-    def init_bucket(self, config: BackendConfig) -> None:
-        auth = oss2.Auth(config.OSS_ACCESS_KEY, config.OSS_ACCESS_SECRET)
-        self._bucket = oss2.Bucket(
-            auth, endpoint=config.OSS_ENDPOINT, bucket_name=config.OSS_BUCKET_NAME
-        )
-
-    def get_bucket(self) -> oss2.Bucket:
-        if self._bucket is None:
-            raise RuntimeError("存储桶尚未初始化，请先调用 init_bucket()")
-        return self._bucket
-
-    def test_bucket(self) -> None:
-        try:
-            self.get_bucket().get_bucket_info()
-            Logger.info("成功连接到 OSS 存储桶")
-        except Exception as exc:
-            Logger.error("无法连接到 OSS 存储桶，请检查配置!")
-            raise exc
-
-    def upload(self, conv_id: str, content: bytes) -> str:
-        """上传已压缩的 JPEG 字节到 OSS，返回永久 URL"""
-        file_id = str(uuid.uuid4())
-        path = f"{conv_id}/{file_id}.jpg"
-        self.get_bucket().put_object(path, content)
-        return f"https://draftmind.oss-cn-beijing.aliyuncs.com/{path}"
-
-
-# ================================================================
-# 图纸数据模型
-# ================================================================
-
-def _to_float(v: Any) -> float:
-    if v is None:
-        return 0.0
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-@dataclass
-class BasicInfo:
-    part_name: str
-    drawing_number: str
-    material: str
-    surface_treatment: str
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "BasicInfo":
-        return cls(
-            part_name=str(data.get("part_name") or ""),
-            drawing_number=str(data.get("drawing_number") or ""),
-            material=str(data.get("material") or ""),
-            surface_treatment=str(data.get("surface_treatment") or "无"),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class Dimensions:
-    length: float
-    width: float
-    height_thickness: float
-    other_dimensions: Optional[str] = None
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Dimensions":
-        return cls(
-            length=_to_float(data.get("length")),
-            width=_to_float(data.get("width")),
-            height_thickness=_to_float(data.get("height_thickness")),
-            other_dimensions=data.get("other_dimensions"),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class Tolerance:
-    dimension_name: str
-    basic_size: float
-    upper_deviation: float
-    lower_deviation: float
-    tolerance_code: Optional[str] = None
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Tolerance":
-        return cls(
-            dimension_name=str(data.get("dimension_name") or ""),
-            basic_size=_to_float(data.get("basic_size")),
-            upper_deviation=_to_float(data.get("upper_deviation")),
-            lower_deviation=_to_float(data.get("lower_deviation")),
-            tolerance_code=data.get("tolerance_code"),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class GeometricTolerance:
-    item: str
-    value: float
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "GeometricTolerance":
-        return cls(
-            item=str(data.get("item") or ""),
-            value=_to_float(data.get("value")),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class SurfaceRoughness:
-    surface_location: str
-    value: float
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SurfaceRoughness":
-        return cls(
-            surface_location=str(data.get("surface_location") or ""),
-            value=_to_float(data.get("value")),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class PartDrawing:
-    basic_info: BasicInfo
-    dimensions: Dimensions
-    tolerances: List[Tolerance] = field(default_factory=list)
-    geometric_tolerances: List[GeometricTolerance] = field(default_factory=list)
-    surface_roughness: List[SurfaceRoughness] = field(default_factory=list)
-    technical_requirements: List[str] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PartDrawing":
-        return cls(
-            basic_info=BasicInfo.from_dict(data.get("basic_info") or {}),
-            dimensions=Dimensions.from_dict(data.get("dimensions") or {}),
-            tolerances=[
-                Tolerance.from_dict(t) for t in (data.get("tolerances") or [])
-            ],
-            geometric_tolerances=[
-                GeometricTolerance.from_dict(gt)
-                for gt in (data.get("geometric_tolerances") or [])
-            ],
-            surface_roughness=[
-                SurfaceRoughness.from_dict(sr)
-                for sr in (data.get("surface_roughness") or [])
-            ],
-            technical_requirements=data.get("technical_requirements") or [],
-        )
-
-    @classmethod
-    def from_json(cls, json_str: str) -> "PartDrawing":
-        return cls.from_dict(json.loads(json_str))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    def to_json(self, ensure_ascii: bool = False, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=ensure_ascii, indent=indent)
-
-
-# ================================================================
-# 对话管理
-# ================================================================
-
-@dataclass
-class DraftInformation:
-    title: str = ""
-    draft_number: str = ""
-
-
-class AIConversation:
-    def __init__(self) -> None:
-        self.main_contents: List[List[dict]] = []
-        self.ask_contents: List[List[dict]] = []
-        self.information: DraftInformation = DraftInformation()
-
-    def get_full_context(self) -> List[dict]:
-        result: List[dict] = []
-        for turn in self.main_contents:
-            result.extend(turn)
-        for turn in self.ask_contents:
-            result.extend(turn)
-        return result
-
-    def clear_questions(self) -> None:
-        self.ask_contents = []
-
-    def set_information(self, info: DraftInformation) -> None:
-        self.information = info
-
-    def get_information(self) -> DraftInformation:
-        return self.information
-
-    def to_dict(self) -> dict:
-        return {
-            "info": asdict(self.information),
-            "main_contents": self.main_contents,
-            "ask_contents": self.ask_contents,
-        }
-
-    @staticmethod
-    def from_dict(data: dict) -> "AIConversation":
-        conv = AIConversation()
-        conv.main_contents = data.get("main_contents") or []
-        conv.ask_contents = data.get("ask_contents") or []
-        conv.information = DraftInformation(**(data.get("info") or {}))
-        return conv
-
-
-class ConvStore:
-    def __init__(self) -> None:
-        self.conversations: Dict[str, AIConversation] = {}
-        self.uuid_to_title: Dict[str, str] = {}
-
-    def get(self, conv_uuid: str) -> AIConversation:
-        if conv_uuid not in self.conversations:
-            raise KeyError(f"对话 {conv_uuid} 不存在")
-        return self.conversations[conv_uuid]
-
-    def new(self) -> str:
-        conv_uuid = str(uuid.uuid4())
-        self.conversations[conv_uuid] = AIConversation()
-        return conv_uuid
-
-    def save(self) -> None:
-        os.makedirs("./conversations", exist_ok=True)
-        for conv_uuid, conv in self.conversations.items():
-            with open(f"./conversations/{conv_uuid}.json", "w", encoding="utf-8") as f:
-                json.dump(conv.to_dict(), f, ensure_ascii=False, indent=4)
-        with open("./conversations/index.json", "w", encoding="utf-8") as f:
-            json.dump(self.uuid_to_title, f, ensure_ascii=False, indent=4)
-
-    def load(self) -> None:
-        os.makedirs("./conversations", exist_ok=True)
-        for filename in os.listdir("./conversations"):
-            if not filename.endswith(".json"):
-                continue
-            if filename == "index.json":
-                continue
-            conv_uuid = filename[:-5]
-            path = f"./conversations/{filename}"
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.conversations[conv_uuid] = AIConversation.from_dict(json.load(f))
-                Logger.info(f"已加载对话: {conv_uuid}")
-            except Exception as exc:
-                Logger.warning(f"跳过损坏的对话文件 {filename}: {exc}")
-
-        index_path = "./conversations/index.json"
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                self.uuid_to_title = json.load(f)
-        else:
-            self.uuid_to_title = {
-                cid: conv.get_information().title
-                for cid, conv in self.conversations.items()
-            }
-
-
-# ================================================================
-# 异步任务管理（优化核心）
-# ================================================================
-
-@dataclass
-class Job:
-    job_id: str
-    status: str = "pending"       # pending / processing / done / failed
-    progress: str = "等待处理..."
-    conv_uuid: Optional[str] = None
-    error: Optional[str] = None
-    created_at: float = field(default_factory=time.time)
-
-
-class JobStore:
-    """
-    线程安全的后台任务存储器。
-    所有对 _jobs 的读写均通过 _lock 保护。
-    """
-    _JOB_TTL = 3600  # 已完成任务保留 1 小时后清理
-
-    def __init__(self) -> None:
-        self._jobs: Dict[str, Job] = {}
-        self._lock = threading.Lock()
-
-    def create(self) -> Job:
-        job = Job(job_id=str(uuid.uuid4()))
-        with self._lock:
-            self._jobs[job.job_id] = job
-        return job
-
-    def get(self, job_id: str) -> Optional[Job]:
-        with self._lock:
-            return self._jobs.get(job_id)
-
-    def update(self, job_id: str, **kwargs) -> None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job:
-                for k, v in kwargs.items():
-                    setattr(job, k, v)
-
-    def cleanup(self) -> None:
-        """清理超过 TTL 的已完成/失败任务，防止内存泄漏"""
-        now = time.time()
-        with self._lock:
-            expired = [
-                jid for jid, j in self._jobs.items()
-                if j.status in ("done", "failed")
-                and now - j.created_at > self._JOB_TTL
-            ]
-            for jid in expired:
-                del self._jobs[jid]
-            if expired:
-                Logger.info(f"已清理 {len(expired)} 个过期任务")
-
-
-# ================================================================
-# 审图数据模型
-# ================================================================
-
-@dataclass
-class ReviewIssue:
-    category: str
-    severity: str
-    description: str
-    suggestion: str
-    reference: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ReviewIssue":
-        return cls(
-            category=str(data.get("category") or ""),
-            severity=str(data.get("severity") or "INFO"),
-            description=str(data.get("description") or ""),
-            suggestion=str(data.get("suggestion") or ""),
-            reference=str(data.get("reference") or ""),
-        )
-
-
-@dataclass
-class ReviewReport:
-    overall_pass: bool
-    risk_level: str
-    issues: List[ReviewIssue] = field(default_factory=list)
-    summary: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "overall_pass": self.overall_pass,
-            "risk_level": self.risk_level,
-            "issues": [i.to_dict() for i in self.issues],
-            "summary": self.summary,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ReviewReport":
-        return cls(
-            overall_pass=bool(data.get("overall_pass", False)),
-            risk_level=str(data.get("risk_level") or "HIGH"),
-            issues=[ReviewIssue.from_dict(i) for i in (data.get("issues") or [])],
-            summary=str(data.get("summary") or ""),
-        )
-
-
-# ================================================================
-# 知识库
-# ================================================================
-
-@dataclass
-class KnowledgeEntry:
-    conv_uuid: str
-    part_name: str
-    drawing_number: str
-    material: str
-    surface_treatment: str
-    length: float
-    width: float
-    height_thickness: float
-    technical_requirements: List[str] = field(default_factory=list)
-    embedding: List[float] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "KnowledgeEntry":
-        return cls(
-            conv_uuid=str(data.get("conv_uuid") or ""),
-            part_name=str(data.get("part_name") or ""),
-            drawing_number=str(data.get("drawing_number") or ""),
-            material=str(data.get("material") or ""),
-            surface_treatment=str(data.get("surface_treatment") or ""),
-            length=_to_float(data.get("length")),
-            width=_to_float(data.get("width")),
-            height_thickness=_to_float(data.get("height_thickness")),
-            technical_requirements=data.get("technical_requirements") or [],
-            embedding=data.get("embedding") or [],
-        )
-
-
-class DrawingKnowledgeBase:
-    _DB_PATH = "./knowledge_base/entries.json"
-
-    def __init__(self) -> None:
-        self.entries: List[KnowledgeEntry] = []
-        self._lock = threading.Lock()
-        os.makedirs("./knowledge_base", exist_ok=True)
-        self._load()
-
-    def _load(self) -> None:
-        if not os.path.exists(self._DB_PATH):
-            return
-        try:
-            with open(self._DB_PATH, "r", encoding="utf-8") as f:
-                self.entries = [KnowledgeEntry.from_dict(d) for d in json.load(f)]
-            Logger.info(f"知识库加载完成，共 {len(self.entries)} 条记录")
-        except Exception as exc:
-            Logger.warning(f"知识库加载失败: {exc}")
-
-    def _save(self) -> None:
-        with open(self._DB_PATH, "w", encoding="utf-8") as f:
-            json.dump([e.to_dict() for e in self.entries], f, ensure_ascii=False, indent=2)
-
-    def upsert(self, entry: KnowledgeEntry) -> None:
-        with self._lock:
-            for i, e in enumerate(self.entries):
-                if e.conv_uuid == entry.conv_uuid:
-                    self.entries[i] = entry
-                    self._save()
-                    return
-            self.entries.append(entry)
-            self._save()
-
-    @staticmethod
-    def _cosine(a: List[float], b: List[float]) -> float:
-        va = np.array(a, dtype=float)
-        vb = np.array(b, dtype=float)
-        denom = float(np.linalg.norm(va)) * float(np.linalg.norm(vb))
-        return float(np.dot(va, vb) / denom) if denom > 1e-9 else 0.0
-
-    @staticmethod
-    def _dim_sim(e: KnowledgeEntry, q: KnowledgeEntry) -> float:
-        de = np.array([e.length, e.width, e.height_thickness], dtype=float)
-        dq = np.array([q.length, q.width, q.height_thickness], dtype=float)
-        norm_q = max(float(np.linalg.norm(dq)), 1.0)
-        return float(np.exp(-float(np.linalg.norm(de - dq)) / norm_q))
-
-    def search(
-        self,
-        query: KnowledgeEntry,
-        top_k: int = 5,
-        alpha: float = 0.7,
-        beta: float = 0.3,
-    ) -> List[Tuple[KnowledgeEntry, float]]:
-        scores: List[Tuple[KnowledgeEntry, float]] = []
-        for e in self.entries:
-            if e.conv_uuid == query.conv_uuid:
-                continue
-            sem = (
-                self._cosine(e.embedding, query.embedding)
-                if e.embedding and query.embedding
-                else 0.0
-            )
-            dim = self._dim_sim(e, query)
-            scores.append((e, round(alpha * sem + beta * dim, 4)))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
-
-
-# ================================================================
-# OpenAI 实现
-# ================================================================
-
-class OpenAIImpl:
-    def __init__(self, config: BackendConfig) -> None:
-        self.model = config.OPENAI_MODEL
-        self.max_tokens = int(config.OPENAI_MAX_TOKENS)
-        self.embedding_model = config.OPENAI_EMBEDDING_MODEL
-        self.client = OpenAI(
-            api_key=config.OPENAI_API_KEY,
-            base_url=config.OPENAI_API_BASE,
-        )
-
-    def get_response(
-        self,
-        prompt: str,
-        conversation: AIConversation,
-        direction: str,
-        image_url: Optional[str] = None,
-    ) -> str:
-        if image_url:
-            new_msg: dict = {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        else:
-            new_msg = {"role": "user", "content": prompt}
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=conversation.get_full_context() + [new_msg],
-            max_tokens=self.max_tokens,
-        )
-        reply = response.choices[0].message.content
-
-        turn = [new_msg, {"role": "assistant", "content": reply}]
-        if direction == "main":
-            conversation.main_contents.append(turn)
-        elif direction == "ask":
-            conversation.ask_contents.append(turn)
-        return reply
-
-    def get_embedding(self, text: str) -> List[float]:
-        normalized = (text or "").strip()
-        if not normalized:
-            return []
-
-        # Try configured model first, then fall back across common providers.
-        # This project may point base_url to a 3rd-party OpenAI-compatible gateway
-        # (e.g. DashScope), where model names differ from OpenAI official endpoints.
-        fallback_models = [
-            self.embedding_model,
-            "text-embedding-v4",
-            "text-embedding-v3",
-            "text-embedding-v2",
-            "text-embedding-3-large",
-            "text-embedding-3-small",
-            "text-embedding-ada-002",
-        ]
-        tried: List[str] = []
-        last_exc: Optional[Exception] = None
-
-        for m in fallback_models:
-            if not m or m in tried:
-                continue
-            tried.append(m)
-            try:
-                resp = self.client.embeddings.create(input=normalized, model=m)
-                emb = resp.data[0].embedding
-                # Cache the first working model for subsequent calls.
-                if m != self.embedding_model:
-                    Logger.warning(
-                        f"Embedding 模型自动回退: {self.embedding_model} -> {m}"
-                    )
-                    self.embedding_model = m
-                return emb
-            except BadRequestError as exc:
-                # Common failure: model not found / no access
-                last_exc = exc
-                msg = str(exc)
-                if ("model" in msg and "does not exist" in msg) or ("model_not_found" in msg):
-                    continue
-                raise
-            except Exception as exc:
-                # For OpenAI-compatible gateways, model lookup failures may surface
-                # as other exception types. Keep trying unless it's the last model.
-                last_exc = exc
-                msg = str(exc)
-                if ("model" in msg and "not found" in msg) or ("model_not_found" in msg):
-                    continue
-                # Unknown error: don't mask it by falling back.
-                raise
-
-        raise RuntimeError(
-            "Embedding 模型不可用。已尝试: "
-            + ", ".join(tried)
-            + (f"；最后错误: {last_exc}" if last_exc else "")
-        )
-
-    def config_summary(self) -> dict:
-        return {
-            "model": self.model,
-            "embedding_model": self.embedding_model,
-            "api_base": str(self.client.base_url),
-        }
+# 使用线程池处理后台解析任务，max_workers 控制并发数
+executor = ThreadPoolExecutor(max_workers=4)
+
+# 任务优先级队列（用于 prioritize 功能）
+# 结构: {job_id: priority_value}，值越小优先级越高
+job_priorities: Dict[str, int] = {}
+priority_lock = threading.Lock()
 
 
 # ================================================================
 # 工具函数
 # ================================================================
 
-def extract_json_payload(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
-    if cleaned.lower().startswith("json"):
-        cleaned = cleaned[4:].lstrip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end >= start:
-        cleaned = cleaned[start: end + 1]
-    return cleaned
+def generate_uuid() -> str:
+    """生成唯一标识符，用于会话 ID 和任务 ID"""
+    return str(uuid.uuid4())
 
 
-def read_text_with_fallback(path: str) -> str:
-    last_error: Optional[Exception] = None
-    for enc in ("utf-8", "gbk", "cp936"):
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read()
-        except UnicodeDecodeError as exc:
-            last_error = exc
-    raise last_error
-
-
-def make_embedding_text(pd: PartDrawing) -> str:
-    bi = pd.basic_info
-    reqs = "；".join(pd.technical_requirements)
-    return (
-        f"零件名称：{bi.part_name}；图号：{bi.drawing_number}；"
-        f"材料：{bi.material}；表面处理：{bi.surface_treatment}；技术要求：{reqs}"
-    )
-
-
-def build_kb_entry(
-    conv_uuid: str, pd: PartDrawing, embedding: List[float]
-) -> KnowledgeEntry:
-    return KnowledgeEntry(
-        conv_uuid=conv_uuid,
-        part_name=pd.basic_info.part_name,
-        drawing_number=pd.basic_info.drawing_number,
-        material=pd.basic_info.material,
-        surface_treatment=pd.basic_info.surface_treatment,
-        length=pd.dimensions.length,
-        width=pd.dimensions.width,
-        height_thickness=pd.dimensions.height_thickness,
-        technical_requirements=pd.technical_requirements,
-        embedding=embedding,
-    )
-
-
-# ================================================================
-# 后台解析任务（优化核心）
-# ================================================================
-
-def _parse_worker(job_id: str, raw_content: bytes) -> None:
+def get_oss_bucket():
     """
-    后台线程执行图纸解析全流程：
-    1. 压缩图像（减少 token）
-    2. 转 base64（跳过 OSS 等待，直接传 LLM）
-    3. OSS 上传在独立线程并发执行
-    4. LLM 解析
-    5. 知识库索引在独立线程执行
-    前端通过轮询 /job/<job_id>/status 获取进度。
+    初始化并返回阿里云 OSS Bucket 对象。
+
+    Returns:
+        oss2.Bucket: OSS 存储桶对象，配置失败时返回 None
+    """
+    if not all([OSS_ENDPOINT, OSS_ACCESS_KEY, OSS_ACCESS_SECRET, OSS_BUCKET_NAME]):
+        return None
+    try:
+        auth = oss2.Auth(OSS_ACCESS_KEY, OSS_ACCESS_SECRET)
+        return oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
+    except Exception as e:
+        print(f"[OSS] 初始化失败: {e}")
+        return None
+
+
+def upload_image_to_oss(image_bytes: bytes, filename: str) -> Optional[str]:
+    """
+    将图片上传到阿里云 OSS 并返回访问 URL。
+
+    Args:
+        image_bytes: 图片的二进制数据
+        filename: 存储在 OSS 上的文件名
+
+    Returns:
+        str: 图片的公开访问 URL，上传失败时返回 None
+    """
+    bucket = get_oss_bucket()
+    if not bucket:
+        return None
+    try:
+        key = f"draftmind/uploads/{filename}"
+        bucket.put_object(key, image_bytes)
+        return f"https://{OSS_BUCKET_NAME}.{OSS_ENDPOINT}/{key}"
+    except Exception as e:
+        print(f"[OSS] 上传失败: {e}")
+        return None
+
+
+# [OSS] 本地存储函数 — 图片保存到项目 uploads/ 目录
+def save_image_locally(image_bytes: bytes, filename: str) -> Optional[str]:
+    """
+    将图片保存到本地 uploads/ 目录并返回可访问的相对路径。
+
+    作为 OSS 上传的替代方案，图片默认存储在本地磁盘。
+
+    Args:
+        image_bytes: 图片的二进制数据
+        filename: 保存的文件名
+
+    Returns:
+        str: 本地文件的相对路径（如 "uploads/xxx.jpg"），保存失败时返回 None
     """
     try:
-        # Step 1: 压缩图像
-        jobs.update(job_id, status="processing", progress="正在压缩图像...")
-        compressed = compress_image(raw_content)
+        filepath = os.path.join(LOCAL_STORAGE_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+        # 返回相对路径，供前端通过 /uploads/ 路由访问
+        return f"uploads/{filename}"
+    except Exception as e:
+        print(f"[Local] 本地存储失败: {e}")
+        return None
 
-        # Step 2: 创建对话上下文
-        conv_uuid = store.new()
-        conv = store.get(conv_uuid)
 
-        # Step 3: 将 OSS 上传放入独立线程（与 LLM 调用并发）
-        def _upload_oss():
-            try:
-                url = oss.upload(conv_uuid, compressed)
-                Logger.info(f"OSS 后台上传完成: {url}")
-            except Exception as exc:
-                Logger.warning(f"OSS 后台上传失败（不影响主流程）: {exc}")
+def call_vlm_api(image_base64_list: List[str], user_prompt: str = "") -> Optional[dict]:
+    """
+    调用通义千问多模态视觉大模型解析工程图纸。
 
-        threading.Thread(target=_upload_oss, daemon=True).start()
+    将图片编码为 base64 后发送给 VLM，由模型提取结构化信息。
 
-        # Step 4: 用 base64 直接调用 LLM（无需等待 OSS）
-        jobs.update(job_id, progress="AI 正在解析图纸，请稍候...")
-        b64_url = image_to_base64_url(compressed)
-        try:
-            raw_reply = ai.get_response(
-                _MAIN_PROMPT, conv, "main", image_url=b64_url
-            )
-        except BadRequestError as exc:
-            jobs.update(job_id, status="failed", error=f"OpenAI 请求被拒绝: {exc}")
-            return
-        except Exception as exc:
-            jobs.update(job_id, status="failed", error=f"LLM 调用失败: {exc}")
-            return
+    Args:
+        image_base64_list: 图片 base64 编码列表（支持多页图纸）
+        user_prompt: 用户附加的提示词（可选）
 
-        # Step 5: 解析 JSON
-        jobs.update(job_id, progress="正在解析返回结果...")
-        normalized = extract_json_payload(raw_reply)
-        try:
-            parsed = json.loads(normalized)
-        except ValueError:
-            jobs.update(
-                job_id, status="failed",
-                error=f"模型回复无法解析为 JSON，原始回复: {raw_reply[:200]}"
-            )
-            return
+    Returns:
+        dict: 模型返回的结构化 JSON 数据，调用失败时返回 None
+    """
+    if not OPENAI_API_KEY:
+        print("[VLM] 未配置 OPENAI_API_KEY，跳过模型调用")
+        return None
 
-        if "error" in parsed:
-            jobs.update(
-                job_id, status="failed",
-                error=f"图纸解析失败: {parsed['error']}"
-            )
-            return
+    # 构建多模态消息：将所有图片页合并为一条消息
+    content = []
+    for img_b64 in image_base64_list:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+        })
 
-        try:
-            part_drawing = PartDrawing.from_dict(parsed)
-        except Exception as exc:
-            jobs.update(job_id, status="failed", error=f"数据结构化失败: {exc}")
-            return
+    # 如果有附加提示词，追加到消息末尾
+    if user_prompt:
+        content.append({"type": "text", "text": user_prompt})
 
-        # Step 6: 持久化
-        jobs.update(job_id, progress="正在保存解析结果...")
-        conv.set_information(
-            DraftInformation(
-                title=part_drawing.basic_info.part_name,
-                draft_number=part_drawing.basic_info.drawing_number,
-            )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content}
+    ]
+
+    try:
+        # 使用 OpenAI 兼容接口调用通义千问
+        resp = requests.post(
+            f"{OPENAI_API_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "messages": messages,
+                "max_tokens": OPENAI_MAX_TOKENS,
+                "temperature": 0.1,  # 低温度确保输出稳定性
+                # 关闭 thinking 模式，避免思考过程消耗 max_tokens 导致 JSON 截断
+                "enable_thinking": False,
+            },
+            timeout=180,  # 大图解析耗时较长，放宽超时
         )
-        store.uuid_to_title[conv_uuid] = part_drawing.basic_info.part_name
-        store.save()
+        # 打印 HTTP 状态码，方便排查
+        print(f"[VLM] API 响应状态码: {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[VLM] API 错误响应: {resp.text[:500]}")
+        resp.raise_for_status()
+        result = resp.json()
 
-        os.makedirs("./drawing_data", exist_ok=True)
-        with open(f"./drawing_data/{conv_uuid}.json", "w", encoding="utf-8") as f:
-            f.write(part_drawing.to_json())
+        # 从模型响应中提取 JSON 内容
+        content_text = result["choices"][0]["message"]["content"]
+        print(f"[VLM] 模型原始响应长度: {len(content_text)} 字符")
 
-        # Step 7: 知识库索引放入独立线程
-        def _index_kb():
-            try:
-                emb = ai.get_embedding(make_embedding_text(part_drawing))
-                kb.upsert(build_kb_entry(conv_uuid, part_drawing, emb))
-                Logger.info(f"知识库索引完成: {conv_uuid}")
-            except Exception as exc:
-                Logger.warning(f"知识库索引失败（不影响主流程）: {exc}")
+        # --- 多层清理策略，处理模型返回的各种非纯 JSON 格式 ---
 
-        threading.Thread(target=_index_kb, daemon=True).start()
+        # 1. 去除 qwen3-thinking 模型生成的 <think>...</think> 思考过程
+        import re
+        content_text = re.sub(r"<think>[\s\S]*?</think>", "", content_text).strip()
 
-        jobs.update(job_id, status="done", conv_uuid=conv_uuid, progress="解析完成")
-        Logger.info(f"任务完成: job_id={job_id}, conv_uuid={conv_uuid}")
+        # 2. 去除 Markdown 代码块标记（```json ... ``` 或 ``` ... ```）
+        content_text = re.sub(r"^```(?:json)?\s*\n?", "", content_text.strip())
+        content_text = re.sub(r"\n?```\s*$", "", content_text.strip())
 
-    except Exception as exc:
-        Logger.error(f"解析任务异常: job_id={job_id}, error={exc}")
-        jobs.update(job_id, status="failed", error=str(exc))
+        # 3. 用正则提取第一个完整的 JSON 对象 {...}
+        #    处理模型在 JSON 前后附加说明文字的情况
+        json_match = re.search(r"\{[\s\S]*\}", content_text)
+        if json_match:
+            content_text = json_match.group(0)
+
+        # 4. 尝试解析 JSON
+        parsed = json.loads(content_text)
+
+        # 5. 校验返回的是 dict 而非 list 或其他类型
+        if not isinstance(parsed, dict):
+            print(f"[VLM] 模型返回了非字典类型: {type(parsed)}")
+            return None
+
+        print(f"[VLM] JSON 解析成功，字段: {list(parsed.keys())}")
+        return parsed
+
+    except json.JSONDecodeError as e:
+        print(f"[VLM] JSON 解析失败: {e}")
+        print(f"[VLM] 清理后内容(前800字符): {content_text[:800]}")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"[VLM] API 调用超时（180秒），图片可能过大")
+        return None
+    except Exception as e:
+        print(f"[VLM] API 调用失败: {e}")
+        return None
+
+
+def call_embedding_api(text: str) -> Optional[List[float]]:
+    """
+    调用通义千问文本嵌入模型，将文本转换为向量表示。
+
+    用于相似图纸推荐和语义搜索的向量计算。
+
+    Args:
+        text: 待嵌入的文本内容
+
+    Returns:
+        list[float]: 文本的向量嵌入，调用失败时返回 None
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            f"{OPENAI_API_BASE}/embeddings",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
+    except Exception as e:
+        print(f"[Embedding] API 调用失败: {e}")
+        return None
+
+
+def image_to_base64(image_bytes: bytes) -> str:
+    """
+    将图片二进制数据编码为 base64 字符串。
+
+    Args:
+        image_bytes: 图片的原始二进制数据
+
+    Returns:
+        str: base64 编码的字符串
+    """
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+
+def compress_image(image_bytes: bytes, max_size: int = 1024, quality: int = 85) -> bytes:
+    """
+    压缩图片以减少上传到 VLM 的数据量。
+
+    对大尺寸图片进行缩放和 JPEG 压缩，在保持可读性的前提下减小体积。
+
+    Args:
+        image_bytes: 原始图片二进制数据
+        max_size: 图片最大边长（像素），超过则等比缩放
+        quality: JPEG 压缩质量 (1-100)
+
+    Returns:
+        bytes: 压缩后的图片二进制数据
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # 等比缩放，保持最大边不超过 max_size
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=quality)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[Image] 图片压缩失败: {e}")
+        return image_bytes
+
+
+# [CAD] DXF 文件渲染函数 — 将 CAD 图纸转换为图片供 VLM 解析
+def dxf_to_images(dxf_bytes: bytes, dpi: int = 150) -> List[Image.Image]:
+    """
+    将 DXF 文件渲染为 PIL 图片列表。
+
+    使用 ezdxf 读取 DXF 结构，matplotlib 将其渲染为黑白工程图风格的图片。
+    每个 DXF 布局（Layout）渲染为一张图片，模型空间（Model）始终渲染。
+
+    Args:
+        dxf_bytes: DXF 文件的二进制数据
+        dpi: 渲染分辨率
+
+    Returns:
+        list[Image.Image]: 渲染后的图片列表；失败时返回空列表
+    """
+    if not CAD_SUPPORT:
+        print("[CAD] ezdxf 或 matplotlib 未安装，无法解析 DXF 文件")
+        return []
+
+    try:
+        # 从字节流加载 DXF 文档
+        doc = ezdxf.readfile(io.BytesIO(dxf_bytes))
+        msp = doc.modelspace()  # 模型空间（主绘图区域）
+
+        images = []
+        # 遍历所有布局（Model + 用户创建的布局如 Layout1）
+        for layout in doc.layouts:
+            fig, ax = plt.subplots(figsize=(16, 12), dpi=dpi)
+            ax.set_facecolor("white")
+            ax.set_aspect("equal")
+            ax.axis("off")
+
+            # 使用 ezdxf 内置的 matplotlib 绘制后端渲染所有图元
+            # 包括 LINE, ARC, CIRCLE, LWPOLYLINE, INSERT(块引用) 等
+            from ezdxf.addons.drawing import RenderContext, Frontend
+            from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+
+            ctx = RenderContext(doc)
+            out = MatplotlibBackend(ax)
+            Frontend(ctx, out).draw_layout(layout, finalize=True)
+
+            # 将 matplotlib 图形转换为 PIL Image
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                        facecolor="white", edgecolor="none")
+            plt.close(fig)
+            buf.seek(0)
+            images.append(Image.open(buf).convert("RGB"))
+
+        return images if images else []
+
+    except Exception as e:
+        print(f"[CAD] DXF 渲染失败: {e}")
+        return []
+
+
+# [CAD] DWG 文件处理函数 — 占位实现，需配合外部转换工具
+def dwg_to_images(dwg_bytes: bytes) -> List[Image.Image]:
+    """
+    将 DWG 文件渲染为图片（需要外部 ODA File Converter）。
+
+    DWG 是 AutoCAD 私有格式，Python 无法直接解析。
+    部署时需安装 ODA File Converter 并配置 DWG_CONVERTER_PATH 环境变量。
+    下载地址: https://www.opendesign.com/guestfiles/oda_file_converter
+
+    Args:
+        dwg_bytes: DWG 文件的二进制数据
+
+    Returns:
+        list[Image.Image]: 渲染后的图片列表；不支持时返回空列表
+    """
+    # DWG 转换需要外部工具，当前返回空列表
+    # 如需支持，请安装 ODA File Converter 并在此处实现转换逻辑
+    print("[CAD] DWG 格式暂不支持直接解析，请将文件转换为 DXF 格式后重新上传")
+    return []
+
+
+def extract_text_for_embedding(info: dict) -> str:
+    """
+    从图纸结构化信息中提取文本摘要，用于生成向量嵌入。
+
+    将零件名称、材料、尺寸、公差等关键信息组合为一段文本，
+    以便后续进行向量相似度计算。
+
+    Args:
+        info: 图纸解析后的结构化 JSON 数据
+
+    Returns:
+        str: 用于嵌入的文本摘要
+    """
+    parts = []
+    basic = info.get("basic_info", {})
+    if basic.get("part_name"):
+        parts.append(f"零件名称: {basic['part_name']}")
+    if basic.get("material"):
+        parts.append(f"材料: {basic['material']}")
+    if basic.get("surface_treatment"):
+        parts.append(f"表面处理: {basic['surface_treatment']}")
+
+    dims = info.get("dimensions", {})
+    if dims:
+        dim_parts = []
+        if dims.get("length"):
+            dim_parts.append(f"长{dims['length']}mm")
+        if dims.get("width"):
+            dim_parts.append(f"宽{dims['width']}mm")
+        if dims.get("height_thickness"):
+            dim_parts.append(f"高{dims['height_thickness']}mm")
+        if dim_parts:
+            parts.append("尺寸: " + ", ".join(dim_parts))
+
+    # 提取公差代号信息
+    for tol in info.get("tolerances", []):
+        if tol.get("tolerance_code"):
+            parts.append(f"公差: {tol.get('dimension_name', '')} {tol['tolerance_code']}")
+
+    return "; ".join(parts)
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """
+    计算两个向量的余弦相似度。
+
+    Args:
+        a: 向量 a
+        b: 向量 b
+
+    Returns:
+        float: 余弦相似度 [-1, 1]
+    """
+    import numpy as np
+    a_np = np.array(a)
+    b_np = np.array(b)
+    dot = np.dot(a_np, b_np)
+    norm = np.linalg.norm(a_np) * np.linalg.norm(b_np)
+    return float(dot / norm) if norm > 0 else 0.0
+
+
+def compute_dimension_similarity(info_a: dict, info_b: dict) -> float:
+    """
+    计算两张图纸之间的尺寸相似度。
+
+    基于长、宽、高三个维度的归一化差异进行评估。
+    相似度范围 [0, 1]，1 表示完全相同。
+
+    Args:
+        info_a: 图纸 A 的结构化信息
+        info_b: 图纸 B 的结构化信息
+
+    Returns:
+        float: 尺寸相似度分数
+    """
+    import numpy as np
+    dims_a = info_a.get("dimensions", {})
+    dims_b = info_b.get("dimensions", {})
+
+    # 提取三维尺寸，缺失值用 0 替代
+    vec_a = [dims_a.get("length", 0), dims_a.get("width", 0), dims_a.get("height_thickness", 0)]
+    vec_b = [dims_b.get("length", 0), dims_b.get("width", 0), dims_b.get("height_thickness", 0)]
+
+    a_np = np.array(vec_a, dtype=float)
+    b_np = np.array(vec_b, dtype=float)
+
+    max_dim = max(np.max(np.abs(a_np)), np.max(np.abs(b_np)), 1.0)
+    diff = np.abs(a_np - b_np) / max_dim
+    return float(1.0 - np.mean(diff))
+
+
+def format_tolerances_for_frontend(raw_tolerances: list) -> list:
+    """
+    将 VLM 返回的原始公差数据转换为前端 DrawingInfo 组件期望的格式。
+
+    前端 el-table 使用的列字段: feature（特征）、nominal（名义尺寸）、tolerance（公差）
+    VLM 原始字段: dimension_name、basic_size、upper_deviation、lower_deviation、tolerance_code
+
+    Args:
+        raw_tolerances: VLM 返回的公差数组
+
+    Returns:
+        list: 格式化后的公差数组，适配前端表格展示
+    """
+    formatted = []
+    for tol in raw_tolerances:
+        # 构建公差描述字符串，例如 "+0.021 / -0.007" 或 "h7"
+        upper = tol.get("upper_deviation", 0)
+        lower = tol.get("lower_deviation", 0)
+        code = tol.get("tolerance_code")
+
+        if code:
+            # 有公差代号时直接显示（如 h7、H8、f6）
+            tol_str = code
+        else:
+            # 无代号时显示上下偏差
+            upper_str = f"+{upper}" if upper >= 0 else str(upper)
+            lower_str = f"+{lower}" if lower >= 0 else str(lower)
+            tol_str = f"{upper_str} / {lower_str}"
+
+        formatted.append({
+            "feature": tol.get("dimension_name", ""),    # 特征名称（如"轴径 φ45"）
+            "nominal": tol.get("basic_size", 0),         # 名义尺寸（如 45.0）
+            "tolerance": tol_str,                         # 公差描述（如 "h7"）
+            # 保留原始数据，供其他功能（如 SVG 标注）使用
+            "_raw": tol,
+        })
+    return formatted
+
+
+def run_parse_job(job_id: str, conv_uuid: str, image_bytes_list: List[bytes],
+                  filename: str = "", upload_oss: bool = False):
+    """
+    后台异步执行图纸解析任务。
+
+    流程：
+      [CAD] 若为 CAD 文件 → 渲染为图片
+      1. 压缩图片 → 2. 存储图片（本地或 OSS） → 3. 调用 VLM 解析 → 4. 生成嵌入 → 5. 保存结果
+
+    Args:
+        job_id: 任务唯一 ID
+        conv_uuid: 关联的会话 UUID
+        image_bytes_list: 文件二进制数据列表（图片/CAD）
+        filename: [CAD] 原始文件名，用于判断文件类型
+        upload_oss: [OSS] 是否上传到阿里云 OSS，默认 False（存储在本地）
+    """
+    try:
+        # [CAD] CAD 文件预处理：将 DXF/DWG 渲染为图片再进入常规流程
+        ext = os.path.splitext(filename)[1].lower() if filename else ""
+        if ext in (".dxf", ".dwg"):
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["progress"] = "正在解析 CAD 图纸..."
+            jobs[job_id]["progress_pct"] = 0.05
+
+            if ext == ".dxf":
+                rendered = dxf_to_images(image_bytes_list[0])
+            else:
+                rendered = dwg_to_images(image_bytes_list[0])
+
+            if not rendered:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = (
+                    f"无法解析 {ext} 文件。"
+                    + ("请安装 ezdxf 和 matplotlib: pip install ezdxf matplotlib"
+                       if not CAD_SUPPORT else "文件可能已损坏或格式不受支持")
+                )
+                return
+
+            # 渲染成功，将 PIL Image 转为 JPEG 字节流，替换原始输入
+            image_bytes_list = []
+            for img in rendered:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                image_bytes_list.append(buf.getvalue())
+
+        # ---------- 步骤 1: 压缩图片 ----------
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["progress"] = "正在压缩图像..."
+        jobs[job_id]["progress_pct"] = 0.1
+
+        compressed_images = [compress_image(img) for img in image_bytes_list]
+
+        # ---------- 步骤 2: 存储图片（本地 或 OSS） ----------
+        jobs[job_id]["progress"] = "正在保存图像..."
+        jobs[job_id]["progress_pct"] = 0.2
+
+        # [OSS] 根据 upload_oss 标志决定存储位置
+        image_urls = []
+        for idx, img_bytes in enumerate(compressed_images):
+            fname = f"{conv_uuid}_page_{idx+1}.jpg"
+            if upload_oss:
+                # 上传到阿里云 OSS
+                url = upload_image_to_oss(img_bytes, fname)
+            else:
+                # 保存到本地 uploads/ 目录（默认行为）
+                url = save_image_locally(img_bytes, fname)
+            if url:
+                image_urls.append(url)
+
+        # ---------- 步骤 3: 调用 VLM 解析 ----------
+        jobs[job_id]["progress"] = "AI 正在解析图纸，请稍候..."
+        jobs[job_id]["progress_pct"] = 0.4
+
+        image_b64_list = [image_to_base64(img) for img in compressed_images]
+        parsed_info = call_vlm_api(image_b64_list)
+
+        if parsed_info is None:
+            # VLM 调用失败，标记任务失败并提示用户
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = (
+                "AI 解析失败，请检查："
+                "1) .env 中 OPENAI_MODEL 是否为多模态视觉模型（如 qwen-vl-max-latest）；"
+                "2) OPENAI_API_KEY 是否有效；"
+                "3) 图片是否清晰可读。"
+                "详见后端控制台日志。"
+            )
+            return
+
+        # ---------- 步骤 4: 生成向量嵌入 ----------
+        jobs[job_id]["progress"] = "正在生成向量嵌入..."
+        jobs[job_id]["progress_pct"] = 0.8
+
+        text_summary = extract_text_for_embedding(parsed_info)
+        embedding = call_embedding_api(text_summary)
+
+        # ---------- 步骤 5: 保存解析结果 ----------
+        jobs[job_id]["progress"] = "正在保存解析结果..."
+        jobs[job_id]["progress_pct"] = 0.95
+
+        conv_data = {
+            "info": parsed_info,           # 结构化解析数据
+            "image_urls": image_urls,      # [OSS] 图片存储地址（本地路径或 OSS URL）
+            "image_count": len(image_bytes_list),
+            "created_at": time.time(),
+            "title": parsed_info.get("basic_info", {}).get("part_name", ""),
+        }
+        conversations[conv_uuid] = conv_data
+        # 持久化到本地 JSON 文件，重启后可恢复
+        save_conversation_to_disk(conv_uuid, conv_data)
+
+        # 将解析结果加入知识库（用于相似推荐和搜索）
+        knowledge_base[conv_uuid] = {
+            "info": parsed_info,
+            "embedding": embedding,
+            "image_urls": image_urls,
+        }
+
+        # ---------- 任务完成 ----------
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["progress"] = "解析完成"
+        jobs[job_id]["progress_pct"] = 1.0
+        jobs[job_id]["conv_uuid"] = conv_uuid
+
+    except Exception as e:
+        # 任务异常处理
+        print(f"[Job] 任务 {job_id} 执行失败: {e}")
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
 
 
 # ================================================================
-# 初始化
+# API 路由 — 健康检查
 # ================================================================
 
-config = BackendConfig()
-config.load()
+@app.route("/", methods=["GET"])
+def health_check():
+    """
+    健康检查接口。
 
-oss = OSSOperation()
-oss.init_bucket(config)
-try:
-    oss.test_bucket()
-except Exception:
-    Logger.error("无法连接到 OSS 存储桶，程序无法启动!")
-    exit(1)
+    前端通过此接口确认后端服务是否正常运行。
+    对应前端: client.js → checkHealth()
 
-store = ConvStore()
-store.load()
+    Returns:
+        200: {"status": "ok"}
+    """
+    return jsonify({"status": "ok"})
 
-ai = OpenAIImpl(config)
-kb = DrawingKnowledgeBase()
-jobs = JobStore()
 
-app = Flask(__name__)
+# [OSS] 本地文件访问路由 — 供前端访问本地存储的图片
+@app.route("/uploads/<path:filename>", methods=["GET"])
+def serve_upload(filename):
+    """
+    提供本地 uploads/ 目录下图片文件的 HTTP 访问。
+
+    当用户选择本地存储时，前端通过此路由获取图片预览。
+
+    Args:
+        filename: 文件名（如 "xxx_page_1.jpg"）
+
+    Returns:
+        200: 图片文件二进制
+        404: 文件不存在
+    """
+    from flask import send_from_directory
+    return send_from_directory(LOCAL_STORAGE_DIR, filename)
 
 
 # ================================================================
-# Flask 路由
+# API 路由 — 图纸会话管理
 # ================================================================
 
-@app.route("/")
-def r_index():
-    return "DraftMind Backend is running."
+@app.route("/conversation/new", methods=["POST"])
+def create_conversation():
+    """
+    上传图纸并创建异步解析任务。
 
+    接收 multipart/form-data 格式的图片/CAD 文件，创建后台解析任务。
+    对应前端: drawing.js → createDrawingTask()
 
-@app.route("/health", methods=["GET"])
-def r_health():
-    return jsonify({"status": "ok", "openai": ai.config_summary()})
+    请求格式:
+        Content-Type: multipart/form-data
+        字段:
+          - image: 图片/CAD 文件（可多张，支持多页图纸；[CAD] 支持 .dxf/.dwg）
+          - priority: 任务优先级（数字，值越小优先级越高）
+          - upload_oss: [OSS] 是否上传到云端 OSS（"true"/"false"，默认 "false"）
+
+    Returns:
+        200: {"job_id": "xxx", "conv_uuid": "xxx"}
+        400: {"error": "未上传图片"}
+    """
+    # 获取上传的文件列表（图片或 CAD 文件）
+    files = request.files.getlist("image")
+    if not files:
+        return jsonify({"error": "未上传图片"}), 400
+
+    # 读取优先级参数（默认为 10，数值越小优先级越高）
+    priority = int(request.form.get("priority", 10))
+
+    # [OSS] 读取是否上传到云端 OSS（默认 False，存储在本地）
+    upload_oss = request.form.get("upload_oss", "false").lower() == "true"
+
+    # 读取所有文件的二进制数据，并记录第一个文件名（用于 [CAD] 类型判断）
+    image_bytes_list = []
+    first_filename = ""
+    for f in files:
+        if not first_filename:
+            first_filename = f.filename or ""
+        image_bytes_list.append(f.read())
+
+    # 生成唯一标识
+    conv_uuid = generate_uuid()
+    job_id = generate_uuid()
+
+    # 初始化任务状态
+    jobs[job_id] = {
+        "status": "pending",        # 任务状态: pending / processing / done / failed
+        "progress": "等待处理...",    # 当前进度描述
+        "progress_pct": 0.0,        # 进度百分比 (0.0 ~ 1.0)
+        "conv_uuid": conv_uuid,     # 关联的会话 ID
+        "created_at": time.time(),  # 创建时间
+    }
+
+    # 记录任务优先级
+    with priority_lock:
+        job_priorities[job_id] = priority
+
+    # 提交到线程池异步执行（[CAD] 传递文件名以支持 CAD 格式检测；[OSS] 传递存储选项）
+    executor.submit(run_parse_job, job_id, conv_uuid, image_bytes_list, first_filename, upload_oss)
+
+    return jsonify({"job_id": job_id, "conv_uuid": conv_uuid})
 
 
 @app.route("/conversation/list", methods=["GET"])
-def r_list():
-    return jsonify(store.uuid_to_title)
-
-
-@app.route("/conversation/new", methods=["POST"])
-def r_new():
+def list_conversations():
     """
-    接收图纸图片，立即返回 job_id，后台异步执行解析。
-    前端通过 GET /job/<job_id>/status 轮询进度。
-    响应: { "job_id": "..." }
+    获取所有已解析图纸的列表。
+
+    返回 conv_uuid -> title 的映射字典，供前端侧边栏展示历史图纸。
+    对应前端: drawing.js → getConversationList()
+
+    Returns:
+        200: {"uuid1": "零件名称1", "uuid2": "零件名称2", ...}
     """
-    if "image" not in request.files:
-        return jsonify({"error": "缺少 image 字段，请使用 multipart/form-data 上传"}), 400
-
-    raw_content = request.files["image"].read()
-    if not raw_content:
-        return jsonify({"error": "上传的图片内容为空"}), 400
-
-    job = jobs.create()
-    threading.Thread(
-        target=_parse_worker,
-        args=(job.job_id, raw_content),
-        daemon=True,
-    ).start()
-
-    Logger.info(f"已创建解析任务: job_id={job.job_id}")
-    return jsonify({"job_id": job.job_id})
-
-
-@app.route("/job/<job_id>/status", methods=["GET"])
-def r_job_status(job_id: str):
-    """
-    查询解析任务进度。
-    响应:
-    {
-        "job_id": "...",
-        "status": "pending|processing|done|failed",
-        "progress": "当前步骤描述",
-        "conv_uuid": "...（仅 status=done 时有值）",
-        "error": "...（仅 status=failed 时有值）"
-    }
-    """
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "任务不存在或已过期"}), 404
-
-    resp = {
-        "job_id": job.job_id,
-        "status": job.status,
-        "progress": job.progress,
-    }
-    if job.conv_uuid:
-        resp["conv_uuid"] = job.conv_uuid
-    if job.error:
-        resp["error"] = job.error
-    return jsonify(resp)
-
-
-@app.route("/conversation/<conv_uuid>/context", methods=["GET"])
-def r_context(conv_uuid: str):
-    try:
-        return jsonify(store.get(conv_uuid).ask_contents)
-    except KeyError:
-        return jsonify({"error": "对话不存在"}), 404
+    result = {}
+    for conv_uuid, data in conversations.items():
+        title = data.get("title", "")
+        result[conv_uuid] = title
+    return jsonify(result)
 
 
 @app.route("/conversation/<conv_uuid>/info", methods=["GET"])
-def r_info(conv_uuid: str):
-    path = f"./drawing_data/{conv_uuid}.json"
-    if not os.path.exists(path):
-        return jsonify({"error": "图纸信息不存在，请先上传并解析图纸"}), 404
-    return jsonify(PartDrawing.from_json(read_text_with_fallback(path)).to_dict())
+def get_conversation_info(conv_uuid):
+    """
+    获取指定图纸的解析结果。
 
+    返回前端展示所需的结构化信息（基本尺寸、公差等）。
+    对应前端: drawing.js → getDrawingInfo()
+    前端组件: DrawingInfo.vue 使用此数据展示图纸详情
 
-@app.route("/conversation/<conv_uuid>/ask", methods=["POST"])
-def r_ask(conv_uuid: str):
-    try:
-        conv = store.get(conv_uuid)
-    except KeyError:
-        return jsonify({"error": "对话不存在"}), 404
+    Args:
+        conv_uuid: 图纸会话 UUID
 
-    body = request.get_json(force=True, silent=True) or {}
-    question = str(body.get("question") or "").strip()
-    if not question:
-        return jsonify({"error": "question 字段不能为空"}), 400
+    Returns:
+        200: 图纸结构化信息 JSON
+        404: {"error": "图纸不存在"}
+    """
+    conv = conversations.get(conv_uuid)
+    if not conv:
+        return jsonify({"error": "图纸不存在"}), 404
 
-    try:
-        answer = ai.get_response(question, conv, "ask")
-    except Exception as exc:
-        Logger.error(f"追问 LLM 失败: {exc}")
-        return jsonify({"error": f"LLM 调用失败: {exc}"}), 500
+    info = conv["info"]
 
-    store.save()
-    return jsonify({"answer": answer})
+    # 转换公差格式以适配前端 DrawingInfo 组件的 el-table 列定义
+    # 前端期望: feature / nominal / tolerance
+    # VLM 返回: dimension_name / basic_size / upper_deviation / lower_deviation
+    frontend_info = dict(info)
+    # 返回图片地址列表，供前端加载历史图纸预览
+    frontend_info["image_urls"] = conv.get("image_urls", [])
+    if "tolerances" in frontend_info:
+        frontend_info["tolerances"] = format_tolerances_for_frontend(info.get("tolerances", []))
+
+    return jsonify(frontend_info)
 
 
 @app.route("/conversation/<conv_uuid>/review", methods=["POST"])
-def r_review_create(conv_uuid: str):
-    path = f"./drawing_data/{conv_uuid}.json"
-    if not os.path.exists(path):
-        return jsonify({"error": "图纸信息不存在，请先上传并解析图纸"}), 404
+def review_conversation(conv_uuid):
+    """
+    对图纸进行合规性审查。
 
-    body = request.get_json(force=True, silent=True) or {}
-    custom_rules = str(body.get("custom_rules") or "").strip()
+    基于预设国标规则和用户自定义规则，对图纸进行全面审查。
+    对应前端: drawing.js → getReviewReport()
+    前端组件: ReviewPanel.vue 展示审查结果
 
-    part_drawing = PartDrawing.from_json(read_text_with_fallback(path))
-    custom_section = (
-        f"\n## 企业自定义审核规则\n{custom_rules}\n" if custom_rules else ""
-    )
-    prompt = (
-        _REVIEW_PROMPT_TEMPLATE
-        .replace("{CUSTOM_RULES_SECTION}", custom_section)
-        .replace("{DRAWING_JSON}", part_drawing.to_json())
-    )
+    Args:
+        conv_uuid: 图纸会话 UUID
+
+    请求体 (JSON):
+        {
+            "custom_rules": "企业自定义规则文本（可选）"
+        }
+
+    Returns:
+        200: 审查报告 JSON，包含 overall_pass / risk_level / issues / summary
+        404: {"error": "图纸不存在"}
+    """
+    conv = conversations.get(conv_uuid)
+    if not conv:
+        return jsonify({"error": "图纸不存在"}), 404
+
+    # 获取用户自定义审查规则
+    body = request.get_json(silent=True) or {}
+    custom_rules = body.get("custom_rules", "")
+
+    info = conv["info"]
+
+    # ---------- 执行审查逻辑 ----------
+    # 这里实现基于规则的自动化审查
+    # 生产环境中可扩展为调用 LLM 进行更深入的审查
+    issues = []
+    basic = info.get("basic_info", {})
+    dims = info.get("dimensions", {})
+    tolerances = info.get("tolerances", [])
+
+    # 规则 1: 检查必要字段是否完整
+    if not basic.get("part_name"):
+        issues.append({
+            "severity": "WARNING",
+            "description": "图纸缺少零件名称",
+            "suggestion": "请在标题栏中明确标注零件名称",
+            "reference": "GB/T 4458.1",
+        })
+
+    if not basic.get("drawing_number"):
+        issues.append({
+            "severity": "WARNING",
+            "description": "图纸缺少图号",
+            "suggestion": "请在标题栏中标注唯一图号",
+            "reference": "GB/T 4458.1",
+        })
+
+    if not basic.get("material"):
+        issues.append({
+            "severity": "ERROR",
+            "description": "图纸缺少材料标注",
+            "suggestion": "请在标题栏中标注材料牌号及标准号",
+            "reference": "GB/T 4458.1",
+        })
+
+    # 规则 2: 检查尺寸合理性
+    if dims.get("length", 0) <= 0 or dims.get("width", 0) <= 0:
+        issues.append({
+            "severity": "WARNING",
+            "description": "主要尺寸信息不完整或为零",
+            "suggestion": "请确认图纸中是否标注了完整的外形尺寸",
+            "reference": "GB/T 4458.4",
+        })
+
+    # 规则 3: 检查公差标注
+    if not tolerances:
+        issues.append({
+            "severity": "WARNING",
+            "description": "未检测到尺寸公差标注",
+            "suggestion": "关键配合尺寸应标注公差",
+            "reference": "GB/T 1800.1",
+        })
+
+    # 规则 4: 检查形位公差
+    if not info.get("geometric_tolerances"):
+        issues.append({
+            "severity": "WARNING",
+            "description": "未检测到形位公差标注",
+            "suggestion": "关键特征应考虑标注形位公差",
+            "reference": "GB/T 1182",
+        })
+
+    # 规则 5: 检查表面粗糙度
+    if not info.get("surface_roughness"):
+        issues.append({
+            "severity": "WARNING",
+            "description": "未检测到表面粗糙度标注",
+            "suggestion": "配合面和重要表面应标注粗糙度",
+            "reference": "GB/T 131",
+        })
+
+    # 规则 6: 应用自定义规则（如有）
+    if custom_rules:
+        # 简单的关键词匹配规则引擎
+        # 生产环境可替换为 LLM 驱动的智能审查
+        custom_lines = [line.strip() for line in custom_rules.split("\n") if line.strip()]
+        material = basic.get("material", "")
+        for rule in custom_lines:
+            # 示例: "禁止使用 Q235 材料"
+            if "禁止" in rule and "材料" in rule:
+                forbidden = rule.replace("禁止使用", "").replace("材料", "").strip()
+                if forbidden and forbidden in material:
+                    issues.append({
+                        "severity": "ERROR",
+                        "description": f"违反自定义规则：使用了被禁止的材料 {forbidden}",
+                        "suggestion": f"请更换材料，当前材料: {material}",
+                        "reference": "企业自定义规则",
+                    })
+
+    # ---------- 综合评估 ----------
+    error_count = sum(1 for i in issues if i["severity"] == "ERROR")
+    warning_count = sum(1 for i in issues if i["severity"] == "WARNING")
+
+    # 风险等级判定
+    if error_count > 0:
+        risk_level = "HIGH"
+        overall_pass = False
+    elif warning_count > 2:
+        risk_level = "MEDIUM"
+        overall_pass = False
+    elif warning_count > 0:
+        risk_level = "LOW"
+        overall_pass = True
+    else:
+        risk_level = "NONE"
+        overall_pass = True
+
+    # 生成审查摘要
+    if overall_pass:
+        summary = f"图纸审查通过。发现 {warning_count} 个改进建议。"
+    else:
+        summary = f"图纸审查未通过。发现 {error_count} 个错误和 {warning_count} 个警告，请修正后重新提交。"
+
+    report = {
+        "overall_pass": overall_pass,    # 是否通过
+        "risk_level": risk_level,         # 风险等级: NONE / LOW / MEDIUM / HIGH
+        "issues": issues,                 # 问题列表
+        "summary": summary,               # 审查摘要
+        "error_count": error_count,
+        "warning_count": warning_count,
+    }
+
+    return jsonify(report)
+
+
+@app.route("/conversation/<conv_uuid>/ask", methods=["POST"])
+def ask_question(conv_uuid):
+    """
+    基于图纸上下文的智能问答。
+
+    用户输入问题，系统结合图纸解析结果调用 LLM 生成回答。
+    对应前端: drawing.js → askDrawingQuestion()
+    前端组件: ChatPanel.vue 展示对话
+
+    Args:
+        conv_uuid: 图纸会话 UUID
+
+    请求体 (JSON):
+        {
+            "question": "用户的问题文本"
+        }
+
+    Returns:
+        200: {"answer": "AI 的回答"}
+        400: {"error": "请输入问题"}
+        404: {"error": "图纸不存在"}
+    """
+    conv = conversations.get(conv_uuid)
+    if not conv:
+        return jsonify({"error": "图纸不存在"}), 404
+
+    body = request.get_json(silent=True) or {}
+    question = body.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "请输入问题"}), 400
+
+    info = conv["info"]
+
+    # ---------- 构建问答上下文 ----------
+    # 将图纸结构化信息作为上下文提供给 LLM
+    context = json.dumps(info, ensure_ascii=False, indent=2)
+
+    if not OPENAI_API_KEY:
+        # 未配置 API Key 时返回模拟回答（开发调试用）
+        return jsonify({
+            "answer": f"[模拟回答] 关于您的问题「{question}」，基于当前图纸信息："
+                      f"零件名称为 {info.get('basic_info', {}).get('part_name', '未知')}，"
+                      f"材料为 {info.get('basic_info', {}).get('material', '未知')}。"
+                      f"（注：请配置 OPENAI_API_KEY 以获取真实 AI 回答）"
+        })
 
     try:
-        resp = ai.client.chat.completions.create(
-            model=ai.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=ai.max_tokens,
+        # 调用 LLM 进行问答
+        resp = requests.post(
+            f"{OPENAI_API_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是一名专业的机械工程师助手。"
+                            "根据用户提供的工程图纸信息回答问题。"
+                            "回答应准确、专业、简洁。"
+                            "如果图纸信息中没有相关内容，请如实说明。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"图纸信息:\n{context}\n\n问题: {question}",
+                    },
+                ],
+                "max_tokens": 2048,
+                "temperature": 0.3,
+            },
+            timeout=60,
         )
-        raw = resp.choices[0].message.content
-    except Exception as exc:
-        Logger.error(f"审图 LLM 失败: {exc}")
-        return jsonify({"error": f"LLM 调用失败: {exc}"}), 500
-
-    try:
-        report = ReviewReport.from_dict(json.loads(extract_json_payload(raw)))
-    except Exception as exc:
-        return jsonify({"error": "审图报告解析失败", "raw": raw, "detail": str(exc)}), 500
-
-    os.makedirs("./review_reports", exist_ok=True)
-    with open(f"./review_reports/{conv_uuid}.json", "w", encoding="utf-8") as f:
-        json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
-
-    return jsonify(report.to_dict())
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"]
+        return jsonify({"answer": answer})
+    except Exception as e:
+        print(f"[Ask] LLM 调用失败: {e}")
+        return jsonify({"error": f"AI 回答生成失败: {str(e)}"}), 500
 
 
-@app.route("/conversation/<conv_uuid>/review", methods=["GET"])
-def r_review_get(conv_uuid: str):
-    report_path = f"./review_reports/{conv_uuid}.json"
-    if not os.path.exists(report_path):
-        # 前端会在加载历史图纸时尝试拉取 review；没有报告属于正常状态。
-        # 返回 200 + 空对象，避免前端将其视为错误并弹出提示。
-        return jsonify({}), 200
-    with open(report_path, "r", encoding="utf-8") as f:
-        return jsonify(json.load(f))
+# ================================================================
+# API 路由 — 异步任务管理
+# ================================================================
 
+@app.route("/job/<job_id>/status", methods=["GET"])
+def get_job_status(job_id):
+    """
+    查询异步解析任务的执行状态。
+
+    前端通过轮询此接口实时更新进度条。
+    对应前端: job.js → getJobStatus()
+    前端组件: TaskProgress.vue 每 3 秒轮询一次
+
+    Args:
+        job_id: 任务 ID
+
+    Returns:
+        200: {
+            "status": "pending" | "processing" | "done" | "failed",
+            "progress": "进度描述文本",
+            "progress_pct": 0.0 ~ 1.0,
+            "conv_uuid": "xxx",      // 仅 status=done 时返回
+            "error": "xxx"           // 仅 status=failed 时返回
+        }
+        404: {"error": "任务不存在"}
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "任务不存在"}), 404
+
+    return jsonify({
+        "status": job["status"],
+        "progress": job.get("progress", ""),
+        "progress_pct": job.get("progress_pct", 0),
+        "conv_uuid": job.get("conv_uuid"),
+        "error": job.get("error"),
+    })
+
+
+@app.route("/job/<job_id>/prioritize", methods=["POST"])
+def prioritize_job(job_id):
+    """
+    提升异步任务的优先级。
+
+    当用户切换到正在解析的图纸时，前端自动调用此接口
+    以优先处理用户当前查看的图纸。
+    对应前端: job.js → prioritizeJob()
+    前端触发时机: DrawingSidebar.vue 切换图纸时
+
+    Args:
+        job_id: 任务 ID
+
+    请求体 (JSON):
+        {
+            "priority": 0    // 优先级值，0 为最高
+        }
+
+    Returns:
+        200: {"status": "ok", "job_id": "xxx"}
+        404: {"error": "任务不存在"}
+    """
+    if job_id not in jobs:
+        return jsonify({"error": "任务不存在"}), 404
+
+    body = request.get_json(silent=True) or {}
+    new_priority = body.get("priority", 0)
+
+    # 更新优先级记录
+    with priority_lock:
+        job_priorities[job_id] = new_priority
+
+    # 更新任务状态提示
+    jobs[job_id]["progress"] = "优先级已提升，正在加速处理..."
+
+    return jsonify({"status": "ok", "job_id": job_id})
+
+
+# ================================================================
+# API 路由 — 知识库（相似推荐 & 语义搜索）
+# ================================================================
 
 @app.route("/knowledge/similar/<conv_uuid>", methods=["GET"])
-def r_similar(conv_uuid: str):
-    path = f"./drawing_data/{conv_uuid}.json"
-    if not os.path.exists(path):
-        return jsonify({"error": "图纸信息不存在"}), 404
+def get_similar_drawings(conv_uuid):
+    """
+    查找与指定图纸相似的历史图纸。
 
+    使用语义向量相似度和尺寸相似度的加权组合进行排序。
+    对应前端: knowledge.js → getSimilarDrawings()
+    前端组件: SimilarPanel.vue 展示推荐结果
+
+    Args:
+        conv_uuid: 作为参考的图纸会话 UUID
+
+    Query Parameters:
+        top_k (int): 返回结果数量，默认 5
+        alpha (float): 语义相似度权重，默认 0.7
+        beta (float): 尺寸相似度权重，默认 0.3
+
+    Returns:
+        200: [
+            {
+                "conv_uuid": "xxx",
+                "part_name": "零件名称",
+                "drawing_number": "图号",
+                "material": "材料",
+                "score": 0.85
+            },
+            ...
+        ]
+        404: {"error": "图纸不存在"}
+    """
+    if conv_uuid not in knowledge_base:
+        return jsonify({"error": "图纸不存在"}), 404
+
+    # 读取查询参数
     top_k = int(request.args.get("top_k", 5))
-    alpha = float(request.args.get("alpha", 0.7))
-    beta = float(request.args.get("beta", 0.3))
+    alpha = float(request.args.get("alpha", 0.7))   # 语义权重
+    beta = float(request.args.get("beta", 0.3))      # 尺寸权重
 
-    part_drawing = PartDrawing.from_json(read_text_with_fallback(path))
-    try:
-        emb = ai.get_embedding(make_embedding_text(part_drawing))
-    except Exception as exc:
-        return jsonify({"error": f"嵌入向量获取失败: {exc}"}), 500
+    ref_entry = knowledge_base[conv_uuid]
+    ref_info = ref_entry["info"]
+    ref_embedding = ref_entry.get("embedding")
 
-    results = kb.search(
-        build_kb_entry(conv_uuid, part_drawing, emb),
-        top_k=top_k, alpha=alpha, beta=beta,
-    )
-    return jsonify([
-        {
-            "conv_uuid": e.conv_uuid,
-            "part_name": e.part_name,
-            "drawing_number": e.drawing_number,
-            "material": e.material,
-            "score": score,
-        }
-        for e, score in results
-    ])
+    results = []
+    for other_uuid, entry in knowledge_base.items():
+        if other_uuid == conv_uuid:
+            continue  # 跳过自身
+
+        # 计算语义相似度（基于向量余弦相似度）
+        sem_score = 0.0
+        if ref_embedding and entry.get("embedding"):
+            sem_score = cosine_similarity(ref_embedding, entry["embedding"])
+            sem_score = max(0.0, sem_score)  # 截断负值
+
+        # 计算尺寸相似度
+        dim_score = compute_dimension_similarity(ref_info, entry["info"])
+
+        # 加权综合分数
+        final_score = alpha * sem_score + beta * dim_score
+
+        other_info = entry["info"]
+        results.append({
+            "conv_uuid": other_uuid,
+            "part_name": other_info.get("basic_info", {}).get("part_name", ""),
+            "drawing_number": other_info.get("basic_info", {}).get("drawing_number", ""),
+            "material": other_info.get("basic_info", {}).get("material", ""),
+            "score": round(final_score, 4),
+        })
+
+    # 按相似度降序排序，取 top_k
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return jsonify(results[:top_k])
 
 
 @app.route("/knowledge/search", methods=["POST"])
-def r_knowledge_search():
-    body = request.get_json(force=True, silent=True) or {}
-    keyword = str(body.get("keyword") or "").strip()
-    top_k = int(body.get("top_k") or 5)
+def semantic_search():
+    """
+    基于关键词的语义搜索。
 
-    if not keyword:
-        return jsonify({"error": "keyword 不能为空"}), 400
+    将用户输入的关键词转换为向量，与知识库中的图纸进行匹配。
+    对应前端: knowledge.js → semanticSearch()
+    前端组件: SimilarPanel.vue 底部搜索区域
 
-    try:
-        emb = ai.get_embedding(keyword)
-    except Exception as exc:
-        return jsonify({"error": f"嵌入向量获取失败: {exc}"}), 500
-
-    dummy = KnowledgeEntry(
-        conv_uuid="__query__", part_name=keyword, drawing_number="",
-        material="", surface_treatment="", length=0, width=0,
-        height_thickness=0, embedding=emb,
-    )
-    results = kb.search(dummy, top_k=top_k, alpha=1.0, beta=0.0)
-    return jsonify([
+    请求体 (JSON):
         {
-            "conv_uuid": e.conv_uuid,
-            "part_name": e.part_name,
-            "drawing_number": e.drawing_number,
-            "score": score,
+            "keyword": "搜索关键词",
+            "top_k": 5       // 可选，默认 5
         }
-        for e, score in results
-    ])
 
+    Returns:
+        200: [
+            {
+                "conv_uuid": "xxx",
+                "part_name": "零件名称",
+                "drawing_number": "图号",
+                "score": 0.85
+            },
+            ...
+        ]
+        400: {"error": "请输入搜索关键词"}
+    """
+    body = request.get_json(silent=True) or {}
+    keyword = body.get("keyword", "").strip()
+    if not keyword:
+        return jsonify({"error": "请输入搜索关键词"}), 400
+
+    top_k = int(body.get("top_k", 5))
+
+    # 将搜索关键词转换为向量
+    query_embedding = call_embedding_api(keyword)
+
+    results = []
+    for conv_uuid, entry in knowledge_base.items():
+        if query_embedding and entry.get("embedding"):
+            # 基于向量相似度匹配
+            score = cosine_similarity(query_embedding, entry["embedding"])
+            score = max(0.0, score)
+        else:
+            # 降级方案：简单的关键词匹配
+            info_text = json.dumps(entry["info"], ensure_ascii=False)
+            score = 1.0 if keyword.lower() in info_text.lower() else 0.0
+
+        if score > 0:
+            info = entry["info"]
+            results.append({
+                "conv_uuid": conv_uuid,
+                "part_name": info.get("basic_info", {}).get("part_name", ""),
+                "drawing_number": info.get("basic_info", {}).get("drawing_number", ""),
+                "score": round(score, 4),
+            })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return jsonify(results[:top_k])
+
+
+# ================================================================
+# 服务启动入口
+# ================================================================
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    print("=" * 50)
+    print("  DraftMind 后端服务启动中...")
+    print(f"  API 地址: http://127.0.0.1:5000")
+    print(f"  VLM 模型: {OPENAI_MODEL}")
+    print(f"  OSS 存储桶: {OSS_BUCKET_NAME or '(未配置)'}")
+    print("=" * 50)
+
+    # 启动 Flask 开发服务器
+    # 生产环境应使用 gunicorn 或 uvicorn
+    app.run(host="127.0.0.1", port=5000, debug=True)
