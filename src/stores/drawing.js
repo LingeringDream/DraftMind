@@ -46,7 +46,10 @@ export const useDrawingStore = defineStore('drawing', () => {
     if (!drawing) return false
 
     let images = drawing.images
-    if (!images || images.length === 0) {
+
+    // [CAD] CAD 文件的 images 为空数组（由 HomeView.vue 设置），跳过客户端图片处理
+    const isCad = images && images.length === 0 && drawing.fileBytes
+    if (!isCad && (!images || images.length === 0)) {
       // 如果图纸没有预处理的图片，现在处理（例如重新上传时）
       images = await preprocessFile(drawing.fileBytes, drawing.fileType)
       if (!images) return false
@@ -56,13 +59,20 @@ export const useDrawingStore = defineStore('drawing', () => {
     // 构建 multipart form data
     const formData = new FormData()
     formData.append('priority', String(priority))
-    const jpegPromises = images.map(async (img, idx) => {
-      const blob = await imageToJpeg(img)
-      return { idx, blob }
-    })
-    const jpegList = await Promise.all(jpegPromises)
-    for (const { idx, blob } of jpegList) {
-      formData.append('image', blob, `page_${idx+1}.jpg`)
+
+    if (isCad) {
+      // [CAD] CAD 文件直接发送原始字节，由后端 run_parse_job 渲染为图片
+      const blob = new Blob([drawing.fileBytes], { type: 'application/octet-stream' })
+      formData.append('image', blob, drawing.name || 'drawing.dxf')
+    } else {
+      const jpegPromises = images.map(async (img, idx) => {
+        const blob = await imageToJpeg(img)
+        return { idx, blob }
+      })
+      const jpegList = await Promise.all(jpegPromises)
+      for (const { idx, blob } of jpegList) {
+        formData.append('image', blob, `page_${idx+1}.jpg`)
+      }
     }
 
     const result = await createDrawingTask(formData)
