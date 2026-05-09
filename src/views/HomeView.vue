@@ -8,16 +8,17 @@
       
       <!-- 未解析任何图纸时显示上传区域 -->
       <div v-if="!store.currentInfo && !Object.keys(store.jobs).length">
+        <!-- [CAD] accept 新增 .dxf/.dwg，提示文字更新为 PDF/图片/CAD -->
         <el-upload
           drag
           multiple
-          accept=".pdf,.jpg,.jpeg,.png,.dxf,.dwg"  <!-- [CAD] 新增 CAD 格式支持 -->
+          accept=".pdf,.jpg,.jpeg,.png,.dxf,.dwg"
           :auto-upload="false"
           :on-change="handleFilesChange"
           :file-list="fileList"
         >
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-          <div class="el-upload__text">拖拽或点击上传图纸（PDF/图片/CAD）</div>  <!-- [CAD] 提示文字更新 -->
+          <div class="el-upload__text">拖拽或点击上传图纸（PDF/图片/CAD）</div>
         </el-upload>
         <el-button v-if="fileList.length" @click="uploadAndParse" type="primary" style="margin-top: 20px">
           上传并解析
@@ -45,16 +46,17 @@
 
   <!-- 上传对话框 -->
   <el-dialog v-model="showUploadDialog" title="上传图纸" width="40%">
+    <!-- [CAD] accept 新增 .dxf/.dwg，提示文字更新为 PDF/图片/CAD -->
     <el-upload
       drag
       multiple
-      accept=".pdf,.jpg,.jpeg,.png,.dxf,.dwg"  <!-- [CAD] 新增 CAD 格式支持 -->
+      accept=".pdf,.jpg,.jpeg,.png,.dxf,.dwg"
       :on-change="handleFilesChange"
       :auto-upload="false"
       :file-list="fileList"
     >
       <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-      <div class="el-upload__text">拖拽或点击选择文件（PDF/图片/CAD）</div>  <!-- [CAD] 提示文字更新 -->
+      <div class="el-upload__text">拖拽或点击选择文件（PDF/图片/CAD）</div>
     </el-upload>
     <template #footer>
       <el-button @click="showUploadDialog = false">取消</el-button>
