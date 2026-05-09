@@ -5,10 +5,9 @@
     </el-aside>
     <el-main>
       <TaskProgress />
-      
-      <!-- 未解析任何图纸时显示上传区域 -->
-      <div v-if="!store.currentInfo && !Object.keys(store.jobs).length">
-        <!-- [CAD] accept 新增 .dxf/.dwg，提示文字更新为 PDF/图片/CAD -->
+
+      <!-- 未上传任何图纸时显示上传区域 -->
+      <div v-if="!store.currentDrawing">
         <el-upload
           drag
           multiple
@@ -20,7 +19,6 @@
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
           <div class="el-upload__text">拖拽或点击上传图纸（PDF/图片/CAD）</div>
         </el-upload>
-        <!-- [OSS] 云端存储开关，默认关闭（图片存储在本地） -->
         <el-switch v-model="uploadToOss" active-text="上传到云端 OSS" inactive-text="本地存储"
                    style="margin-top: 12px" />
         <el-button v-if="fileList.length" @click="uploadAndParse" type="primary" style="margin-top: 12px">
@@ -28,8 +26,26 @@
         </el-button>
       </div>
 
-      <div v-else-if="store.currentInfo">
-        <el-tabs v-model="activeTab">
+      <!-- 已上传图纸：解析前先展示预览图，解析后展示完整信息 -->
+      <div v-else>
+        <!-- 图纸预览（上传后立即显示，不等解析完成） -->
+        <div v-if="previewImages.length" class="preview-section">
+          <h3 class="preview-title">{{ store.currentDrawing?.name || '图纸预览' }}</h3>
+          <div class="preview-grid">
+            <el-image
+              v-for="(img, idx) in previewImages"
+              :key="idx"
+              :src="img.src"
+              fit="contain"
+              class="preview-img"
+              :preview-src-list="previewImages.map(i => i.src)"
+              :initial-index="idx"
+            />
+          </div>
+        </div>
+
+        <!-- 解析完成后展示完整标签页 -->
+        <el-tabs v-if="store.currentInfo" v-model="activeTab" style="margin-top: 16px">
           <el-tab-pane label="图纸信息" name="info">
             <DrawingInfo />
           </el-tab-pane>
@@ -72,7 +88,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'            // 只需导入 ref，不再需要 computed
+import { ref, computed } from 'vue'
 import { useDrawingStore } from '@/stores/drawing'
 import DrawingSidebar from '@/components/DrawingSidebar.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
@@ -88,6 +104,9 @@ const store = useDrawingStore()
 const showUploadDialog = ref(false)
 const fileList = ref([])
 const uploadToOss = ref(false)  // [OSS] 是否上传到云端 OSS，默认关闭（本地存储）
+
+// 当前图纸的预览图片（上传后立即可用，解析完成前也能展示）
+const previewImages = computed(() => store.currentDrawing?.images || [])
 
 // 上传组件文件变化时收集文件
 const handleFilesChange = (file, files) => {
@@ -150,5 +169,30 @@ const activeTab = ref('info')
 .aside {
   background-color: #f5f7fa;
   border-right: 1px solid #e4e7ed;
+}
+
+.preview-section {
+  margin-bottom: 16px;
+}
+
+.preview-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #606266;
+  margin-bottom: 12px;
+}
+
+.preview-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.preview-img {
+  width: 100%;
+  max-height: 500px;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  cursor: pointer;
 }
 </style>
