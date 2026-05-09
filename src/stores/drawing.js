@@ -110,10 +110,28 @@ export const useDrawingStore = defineStore('drawing', () => {
     }
   }
 
-  // 加载历史图纸
+  // 加载历史图纸（含图片预览）
   const loadHistoryDrawing = async (convUuid, title) => {
     const info = await getDrawingInfo(convUuid)
     if (!info) return false
+
+    // 从后端返回的 image_urls 加载图片为 Image 对象
+    let images = null
+    const imageUrls = info.image_urls || []
+    if (imageUrls.length) {
+      const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000'
+      const loadPromises = imageUrls.map(url => new Promise((resolve) => {
+        const img = new Image()
+        img.crossOrigin = 'anonymous'
+        img.onload = () => resolve(img)
+        img.onerror = () => resolve(null)
+        img.src = url.startsWith('http') ? url : `${baseURL}/${url}`
+      }))
+      const loaded = await Promise.all(loadPromises)
+      images = loaded.filter(Boolean)
+      if (!images.length) images = null
+    }
+
     const key = convUuid
     drawings.value[key] = {
       name: title || info.basic_info?.part_name || convUuid.slice(0,8),
@@ -122,7 +140,7 @@ export const useDrawingStore = defineStore('drawing', () => {
       annotations: {},
       chatHistory: [],
       reviewReport: null,
-      images: null, // 历史图纸不存图片数据
+      images,  // 历史图纸图片（从后端加载）
       fileBytes: null,
     }
     currentKey.value = key

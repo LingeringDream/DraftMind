@@ -894,6 +894,8 @@ def get_conversation_info(conv_uuid):
     # 前端期望: feature / nominal / tolerance
     # VLM 返回: dimension_name / basic_size / upper_deviation / lower_deviation
     frontend_info = dict(info)
+    # 返回图片地址列表，供前端加载历史图纸预览
+    frontend_info["image_urls"] = conv.get("image_urls", [])
     if "tolerances" in frontend_info:
         frontend_info["tolerances"] = format_tolerances_for_frontend(info.get("tolerances", []))
 
