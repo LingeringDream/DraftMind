@@ -20,7 +20,10 @@
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
           <div class="el-upload__text">拖拽或点击上传图纸（PDF/图片/CAD）</div>
         </el-upload>
-        <el-button v-if="fileList.length" @click="uploadAndParse" type="primary" style="margin-top: 20px">
+        <!-- [OSS] 云端存储开关，默认关闭（图片存储在本地） -->
+        <el-switch v-model="uploadToOss" active-text="上传到云端 OSS" inactive-text="本地存储"
+                   style="margin-top: 12px" />
+        <el-button v-if="fileList.length" @click="uploadAndParse" type="primary" style="margin-top: 12px">
           上传并解析
         </el-button>
       </div>
@@ -58,6 +61,9 @@
       <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
       <div class="el-upload__text">拖拽或点击选择文件（PDF/图片/CAD）</div>
     </el-upload>
+    <!-- [OSS] 云端存储开关，对话框内同步显示 -->
+    <el-switch v-model="uploadToOss" active-text="上传到云端 OSS" inactive-text="本地存储"
+               style="margin-top: 12px" />
     <template #footer>
       <el-button @click="showUploadDialog = false">取消</el-button>
       <el-button type="primary" @click="uploadAndParse">上传并解析</el-button>
@@ -81,6 +87,7 @@ import { pdfToImages, loadImageFromFile } from '@/utils/image'
 const store = useDrawingStore()
 const showUploadDialog = ref(false)
 const fileList = ref([])
+const uploadToOss = ref(false)  // [OSS] 是否上传到云端 OSS，默认关闭（本地存储）
 
 // 上传组件文件变化时收集文件
 const handleFilesChange = (file, files) => {
@@ -121,7 +128,7 @@ const uploadAndParse = async () => {
   // 解析第一个上传的图纸
   const firstKey = Object.keys(store.drawings)[0]
   if (firstKey) {
-    await store.submitParseJob(firstKey, 0)
+    await store.submitParseJob(firstKey, 0, uploadToOss.value)  // [OSS] 传递存储选项
     ElMessage.success('已提交解析任务，请稍后查看进度')
   }
   showUploadDialog.value = false

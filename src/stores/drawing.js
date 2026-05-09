@@ -41,7 +41,7 @@ export const useDrawingStore = defineStore('drawing', () => {
   }
 
   // 提交解析任务
-  const submitParseJob = async (key, priority = 0) => {
+  const submitParseJob = async (key, priority = 0, uploadOss = false) => {
     const drawing = drawings.value[key]
     if (!drawing) return false
 
@@ -59,6 +59,7 @@ export const useDrawingStore = defineStore('drawing', () => {
     // 构建 multipart form data
     const formData = new FormData()
     formData.append('priority', String(priority))
+    formData.append('upload_oss', String(uploadOss))  // [OSS] 传递存储选项到后端
 
     if (isCad) {
       // [CAD] CAD 文件直接发送原始字节，由后端 run_parse_job 渲染为图片
