@@ -39,6 +39,16 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from PIL import Image
 
+# [CAD] CAD 文件解析依赖（延迟导入，未安装时不影响图片/PDF 功能）
+try:
+    import ezdxf
+    import matplotlib
+    matplotlib.use("Agg")  # 无 GUI 后端，服务器环境适用
+    import matplotlib.pyplot as plt
+    CAD_SUPPORT = True
+except ImportError:
+    CAD_SUPPORT = False
+
 # ================================================================
 # 环境变量加载
 # ================================================================
@@ -300,6 +310,83 @@ def compress_image(image_bytes: bytes, max_size: int = 1024, quality: int = 85) 
         return image_bytes
 
 
+# [CAD] DXF 文件渲染函数 — 将 CAD 图纸转换为图片供 VLM 解析
+def dxf_to_images(dxf_bytes: bytes, dpi: int = 150) -> List[Image.Image]:
+    """
+    将 DXF 文件渲染为 PIL 图片列表。
+
+    使用 ezdxf 读取 DXF 结构，matplotlib 将其渲染为黑白工程图风格的图片。
+    每个 DXF 布局（Layout）渲染为一张图片，模型空间（Model）始终渲染。
+
+    Args:
+        dxf_bytes: DXF 文件的二进制数据
+        dpi: 渲染分辨率
+
+    Returns:
+        list[Image.Image]: 渲染后的图片列表；失败时返回空列表
+    """
+    if not CAD_SUPPORT:
+        print("[CAD] ezdxf 或 matplotlib 未安装，无法解析 DXF 文件")
+        return []
+
+    try:
+        # 从字节流加载 DXF 文档
+        doc = ezdxf.readfile(io.BytesIO(dxf_bytes))
+        msp = doc.modelspace()  # 模型空间（主绘图区域）
+
+        images = []
+        # 遍历所有布局（Model + 用户创建的布局如 Layout1）
+        for layout in doc.layouts:
+            fig, ax = plt.subplots(figsize=(16, 12), dpi=dpi)
+            ax.set_facecolor("white")
+            ax.set_aspect("equal")
+            ax.axis("off")
+
+            # 使用 ezdxf 内置的 matplotlib 绘制后端渲染所有图元
+            # 包括 LINE, ARC, CIRCLE, LWPOLYLINE, INSERT(块引用) 等
+            from ezdxf.addons.drawing import RenderContext, Frontend
+            from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+
+            ctx = RenderContext(doc)
+            out = MatplotlibBackend(ax)
+            Frontend(ctx, out).draw_layout(layout, finalize=True)
+
+            # 将 matplotlib 图形转换为 PIL Image
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                        facecolor="white", edgecolor="none")
+            plt.close(fig)
+            buf.seek(0)
+            images.append(Image.open(buf).convert("RGB"))
+
+        return images if images else []
+
+    except Exception as e:
+        print(f"[CAD] DXF 渲染失败: {e}")
+        return []
+
+
+# [CAD] DWG 文件处理函数 — 占位实现，需配合外部转换工具
+def dwg_to_images(dwg_bytes: bytes) -> List[Image.Image]:
+    """
+    将 DWG 文件渲染为图片（需要外部 ODA File Converter）。
+
+    DWG 是 AutoCAD 私有格式，Python 无法直接解析。
+    部署时需安装 ODA File Converter 并配置 DWG_CONVERTER_PATH 环境变量。
+    下载地址: https://www.opendesign.com/guestfiles/oda_file_converter
+
+    Args:
+        dwg_bytes: DWG 文件的二进制数据
+
+    Returns:
+        list[Image.Image]: 渲染后的图片列表；不支持时返回空列表
+    """
+    # DWG 转换需要外部工具，当前返回空列表
+    # 如需支持，请安装 ODA File Converter 并在此处实现转换逻辑
+    print("[CAD] DWG 格式暂不支持直接解析，请将文件转换为 DXF 格式后重新上传")
+    return []
+
+
 def extract_text_for_embedding(info: dict) -> str:
     """
     从图纸结构化信息中提取文本摘要，用于生成向量嵌入。
@@ -430,19 +517,50 @@ def format_tolerances_for_frontend(raw_tolerances: list) -> list:
     return formatted
 
 
-def run_parse_job(job_id: str, conv_uuid: str, image_bytes_list: List[bytes]):
+def run_parse_job(job_id: str, conv_uuid: str, image_bytes_list: List[bytes],
+                  filename: str = ""):
     """
     后台异步执行图纸解析任务。
 
     流程：
+      [CAD] 若为 CAD 文件 → 渲染为图片
       1. 压缩图片 → 2. 上传 OSS → 3. 调用 VLM 解析 → 4. 生成嵌入 → 5. 保存结果
 
     Args:
         job_id: 任务唯一 ID
         conv_uuid: 关联的会话 UUID
-        image_bytes_list: 图片二进制数据列表（多页图纸）
+        image_bytes_list: 文件二进制数据列表（图片/CAD）
+        filename: [CAD] 原始文件名，用于判断文件类型
     """
     try:
+        # [CAD] CAD 文件预处理：将 DXF/DWG 渲染为图片再进入常规流程
+        ext = os.path.splitext(filename)[1].lower() if filename else ""
+        if ext in (".dxf", ".dwg"):
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["progress"] = "正在解析 CAD 图纸..."
+            jobs[job_id]["progress_pct"] = 0.05
+
+            if ext == ".dxf":
+                rendered = dxf_to_images(image_bytes_list[0])
+            else:
+                rendered = dwg_to_images(image_bytes_list[0])
+
+            if not rendered:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = (
+                    f"无法解析 {ext} 文件。"
+                    + ("请安装 ezdxf 和 matplotlib: pip install ezdxf matplotlib"
+                       if not CAD_SUPPORT else "文件可能已损坏或格式不受支持")
+                )
+                return
+
+            # 渲染成功，将 PIL Image 转为 JPEG 字节流，替换原始输入
+            image_bytes_list = []
+            for img in rendered:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                image_bytes_list.append(buf.getvalue())
+
         # ---------- 步骤 1: 压缩图片 ----------
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["progress"] = "正在压缩图像..."
@@ -544,20 +662,20 @@ def create_conversation():
     """
     上传图纸并创建异步解析任务。
 
-    接收 multipart/form-data 格式的图片文件，创建后台解析任务。
+    接收 multipart/form-data 格式的图片/CAD 文件，创建后台解析任务。
     对应前端: drawing.js → createDrawingTask()
 
     请求格式:
         Content-Type: multipart/form-data
         字段:
-          - image: 图片文件（可多张，支持多页图纸）
+          - image: 图片/CAD 文件（可多张，支持多页图纸；[CAD] 支持 .dxf/.dwg）
           - priority: 任务优先级（数字，值越小优先级越高）
 
     Returns:
         200: {"job_id": "xxx", "conv_uuid": "xxx"}
         400: {"error": "未上传图片"}
     """
-    # 获取上传的图片文件列表
+    # 获取上传的文件列表（图片或 CAD 文件）
     files = request.files.getlist("image")
     if not files:
         return jsonify({"error": "未上传图片"}), 400
@@ -565,9 +683,12 @@ def create_conversation():
     # 读取优先级参数（默认为 10，数值越小优先级越高）
     priority = int(request.form.get("priority", 10))
 
-    # 读取所有图片的二进制数据
+    # 读取所有文件的二进制数据，并记录第一个文件名（用于 [CAD] 类型判断）
     image_bytes_list = []
+    first_filename = ""
     for f in files:
+        if not first_filename:
+            first_filename = f.filename or ""
         image_bytes_list.append(f.read())
 
     # 生成唯一标识
@@ -587,8 +708,8 @@ def create_conversation():
     with priority_lock:
         job_priorities[job_id] = priority
 
-    # 提交到线程池异步执行
-    executor.submit(run_parse_job, job_id, conv_uuid, image_bytes_list)
+    # 提交到线程池异步执行（[CAD] 传递文件名以支持 CAD 格式检测）
+    executor.submit(run_parse_job, job_id, conv_uuid, image_bytes_list, first_filename)
 
     return jsonify({"job_id": job_id, "conv_uuid": conv_uuid})
 
