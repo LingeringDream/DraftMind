@@ -11,7 +11,7 @@
 
 ## 核心功能
 
-- **智能图纸解析**：上传工程图纸图片/PDF，自动识别零件名称、图号、材料、尺寸公差、形位公差等信息，并输出结构化JSON数据。
+- **智能图纸解析**：上传工程图纸图片/PDF/DXF，自动识别零件名称、图号、材料、尺寸公差、形位公差等信息，并输出结构化JSON数据。
 - **AI合规性审查**：基于预设国标（GB/T 4458等）和自定义企业规则，对图纸进行全面审查，输出包含风险等级、问题描述及修改建议的详细报告。
 - **相似图纸推荐**：基于图纸语义和尺寸特征，利用向量嵌入与混合相似度计算，在知识库中快速查找历史相似图纸。
 - **图纸知识问答**：用户可基于已解析的图纸上下文，向AI提出任何相关问题，获得基于图纸内容的精准回答。
@@ -34,7 +34,7 @@
         ▼                                       ▼
  上传图纸/提问/查看报告                   图片压缩 & base64编码
  选择图纸/调整参数                         调用阿里云通义千问API
-                                         操作阿里云OSS存储
+                                         本地存储 / 阿里云OSS存储
                                          管理向量知识库
 ```
 
@@ -77,7 +77,8 @@ cp .env.example .env
 - `OPENAI_API_BASE`: 保持默认的 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
 - `OPENAI_MODEL`: 使用的模型，默认 `qwen3-vl-32b-thinking`。
 - `OPENAI_EMBEDDING_MODEL`: 嵌入模型，默认 `text-embedding-v3`。
-- `OSS_ENDPOINT`: 阿里云 OSS 端点。
+- `OPENAI_MAX_TOKENS`: 模型最大输出 Token 数，默认 `8021`。
+- `OSS_ENDPOINT`: 阿里云 OSS 端点（可选，不配置时使用本地存储）。
 - `OSS_ACCESS_KEY` & `OSS_ACCESS_SECRET`: 您的阿里云 OSS 访问密钥。
 - `OSS_BUCKET_NAME`: 您的 OSS 存储桶名称。
 
@@ -122,13 +123,17 @@ npm run dev
 DraftMind/
 ├── backend.py              # Flask 后端服务
 ├── start.py                # 统一启动脚本
+├── main_prompt.md          # 图纸解析 System Prompt
 ├── requirements.txt        # Python 依赖
 ├── .env.example            # 环境变量示例
 ├── index.html              # 入口 HTML
 ├── package.json            # 前端依赖配置
 ├── vite.config.js          # Vite 构建配置
+├── data/                   # 解析结果持久化目录（自动创建）
+├── uploads/                # 本地图片存储目录（自动创建）
 ├── public/                 # 静态资源
-│   └── logo.png
+│   ├── logo.png
+│   └── pdf.worker.min.mjs  # PDF.js Worker
 └── src/
     ├── api/                # API 请求封装
     │   ├── client.js       # Axios 实例
@@ -177,10 +182,14 @@ DraftMind/
 | **状态管理** | Pinia | Vue 3 官方状态管理方案 |
 | **路由** | Vue Router | 单页应用路由管理 |
 | **HTTP 客户端** | Axios | API 请求与拦截器 |
-| **后端** | Flask | 轻量级 Python Web 框架 |
+| **后端** | Flask + flask-cors | 轻量级 Python Web 框架，支持跨域请求 |
 | **AI 模型** | 通义千问 (qwen3-vl-32b-thinking, text-embedding-v3) | 多模态理解与文本嵌入 |
-| **存储** | 阿里云 OSS | 对象存储，用于保存图纸原图 |
-| **图像处理** | Pillow, pdfjs-dist | 图像压缩、PDF 解析 |
+| **存储** | 本地磁盘 / 阿里云 OSS | 图片默认本地存储，可选 OSS 云端存储 |
+| **数据持久化** | JSON 文件 | 解析结果保存到 `data/` 目录，重启后自动加载 |
+| **图像处理** | Pillow, pdfjs-dist | 图像压缩、PDF 解析（浏览器端） |
+| **CAD 支持** | ezdxf, matplotlib | DXF 文件解析与渲染为图片 |
+| **HTTP 请求** | requests | 调用通义千问 API |
+| **向量计算** | numpy | 余弦相似度与尺寸相似度计算 |
 | **环境管理** | python-dotenv | 加载 `.env` 配置文件 |
 
 ## 开发指南
