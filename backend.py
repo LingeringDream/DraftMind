@@ -241,27 +241,55 @@ def call_vlm_api(image_base64_list: List[str], user_prompt: str = "") -> Optiona
                 "messages": messages,
                 "max_tokens": OPENAI_MAX_TOKENS,
                 "temperature": 0.1,  # 低温度确保输出稳定性
+                # 关闭 thinking 模式，避免思考过程消耗 max_tokens 导致 JSON 截断
+                "enable_thinking": False,
             },
-            timeout=120,
+            timeout=180,  # 大图解析耗时较长，放宽超时
         )
+        # 打印 HTTP 状态码，方便排查
+        print(f"[VLM] API 响应状态码: {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[VLM] API 错误响应: {resp.text[:500]}")
         resp.raise_for_status()
         result = resp.json()
 
         # 从模型响应中提取 JSON 内容
         content_text = result["choices"][0]["message"]["content"]
+        print(f"[VLM] 模型原始响应长度: {len(content_text)} 字符")
 
-        # 清理可能的 Markdown 代码块标记
-        content_text = content_text.strip()
-        if content_text.startswith("```"):
-            content_text = content_text.split("\n", 1)[-1]
-        if content_text.endswith("```"):
-            content_text = content_text.rsplit("```", 1)[0]
-        content_text = content_text.strip()
+        # --- 多层清理策略，处理模型返回的各种非纯 JSON 格式 ---
 
-        return json.loads(content_text)
+        # 1. 去除 qwen3-thinking 模型生成的 <think>...</think> 思考过程
+        import re
+        content_text = re.sub(r"<think>[\s\S]*?</think>", "", content_text).strip()
+
+        # 2. 去除 Markdown 代码块标记（```json ... ``` 或 ``` ... ```）
+        content_text = re.sub(r"^```(?:json)?\s*\n?", "", content_text.strip())
+        content_text = re.sub(r"\n?```\s*$", "", content_text.strip())
+
+        # 3. 用正则提取第一个完整的 JSON 对象 {...}
+        #    处理模型在 JSON 前后附加说明文字的情况
+        json_match = re.search(r"\{[\s\S]*\}", content_text)
+        if json_match:
+            content_text = json_match.group(0)
+
+        # 4. 尝试解析 JSON
+        parsed = json.loads(content_text)
+
+        # 5. 校验返回的是 dict 而非 list 或其他类型
+        if not isinstance(parsed, dict):
+            print(f"[VLM] 模型返回了非字典类型: {type(parsed)}")
+            return None
+
+        print(f"[VLM] JSON 解析成功，字段: {list(parsed.keys())}")
+        return parsed
+
     except json.JSONDecodeError as e:
         print(f"[VLM] JSON 解析失败: {e}")
-        print(f"[VLM] 原始响应: {content_text[:500]}")
+        print(f"[VLM] 清理后内容(前800字符): {content_text[:800]}")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"[VLM] API 调用超时（180秒），图片可能过大")
         return None
     except Exception as e:
         print(f"[VLM] API 调用失败: {e}")
@@ -623,15 +651,16 @@ def run_parse_job(job_id: str, conv_uuid: str, image_bytes_list: List[bytes],
         parsed_info = call_vlm_api(image_b64_list)
 
         if parsed_info is None:
-            # VLM 调用失败时使用空结构（前端可识别并提示）
-            parsed_info = {
-                "basic_info": {},
-                "dimensions": {},
-                "tolerances": [],
-                "geometric_tolerances": [],
-                "surface_roughness": [],
-                "technical_requirements": [],
-            }
+            # VLM 调用失败，标记任务失败并提示用户
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = (
+                "AI 解析失败，请检查："
+                "1) .env 中 OPENAI_MODEL 是否为多模态视觉模型（如 qwen-vl-max-latest）；"
+                "2) OPENAI_API_KEY 是否有效；"
+                "3) 图片是否清晰可读。"
+                "详见后端控制台日志。"
+            )
+            return
 
         # ---------- 步骤 4: 生成向量嵌入 ----------
         jobs[job_id]["progress"] = "正在生成向量嵌入..."
