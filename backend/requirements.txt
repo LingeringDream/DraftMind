@@ -1,0 +1,9 @@
+Django>=5.2,<6.0
+django-cors-headers>=4.7
+python-dotenv>=1.1
+requests>=2.32
+Pillow>=11.0
+oss2>=2.19
+numpy>=2.0
+ezdxf>=1.4
+matplotlib>=3.10
