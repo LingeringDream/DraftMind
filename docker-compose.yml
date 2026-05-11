@@ -1,0 +1,39 @@
+services:
+  # ---------- 前端 ----------
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 构建时的 API 地址（容器内通过 nginx 反代，保持 /api）
+        VITE_API_BASE_URL: /api
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------- 后端 ----------
+  # 请根据实际后端服务调整以下配置
+  backend:
+    image: python:3.11-slim
+    working_dir: /app
+    # 如果后端代码在同一仓库，取消注释以下 build 配置
+    # build:
+    #   context: ../backend
+    #   dockerfile: Dockerfile
+    volumes:
+      # 挂载后端代码目录（按实际情况修改路径）
+      - ${BACKEND_PATH:-../backend}:/app
+    # 覆盖默认启动命令（按实际情况修改）
+    command: >
+      sh -c "
+        pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt 2>/dev/null ||
+        pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ --trusted-host pypi.tuna.tsinghua.edu.cn -r requirements.txt 2>/dev/null ||
+        pip install -r requirements.txt;
+        python app.py
+      "
+    ports:
+      - "${BACKEND_PORT:-5000}:5000"
+    restart: unless-stopped
