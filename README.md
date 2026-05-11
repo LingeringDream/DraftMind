@@ -75,7 +75,7 @@ cp .env.example .env
 编辑 `.env` 文件，配置以下关键项：
 - `OPENAI_API_KEY`: 您的通义千问 API Key。
 - `OPENAI_API_BASE`: 保持默认的 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
-- `OPENAI_MODEL`: 使用的模型，默认 `qwen3-vl-32b-thinking`。
+- `OPENAI_MODEL`: 使用的模型，默认 `qwen3.6-plus`。
 - `OPENAI_EMBEDDING_MODEL`: 嵌入模型，默认 `text-embedding-v3`。
 - `OPENAI_MAX_TOKENS`: 模型最大输出 Token 数，默认 `8021`。
 - `OSS_ENDPOINT`: 阿里云 OSS 端点（可选，不配置时使用本地存储）。
@@ -183,7 +183,7 @@ DraftMind/
 | **路由** | Vue Router | 单页应用路由管理 |
 | **HTTP 客户端** | Axios | API 请求与拦截器 |
 | **后端** | Flask + flask-cors | 轻量级 Python Web 框架，支持跨域请求 |
-| **AI 模型** | 通义千问 (qwen3-vl-32b-thinking, text-embedding-v3) | 多模态理解与文本嵌入 |
+| **AI 模型** | 通义千问 (qwen3.6-plus, text-embedding-v3) | 多模态理解与文本嵌入 |
 | **存储** | 本地磁盘 / 阿里云 OSS | 图片默认本地存储，可选 OSS 云端存储 |
 | **数据持久化** | JSON 文件 | 解析结果保存到 `data/` 目录，重启后自动加载 |
 | **图像处理** | Pillow, pdfjs-dist | 图像压缩、PDF 解析（浏览器端） |
