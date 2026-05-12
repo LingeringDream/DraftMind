@@ -119,6 +119,20 @@ npm run dev
 
 ## Docker 部署
 
+### 前置：配置 Docker 镜像加速器（国内必做）
+
+Docker Hub 在国内访问受限，首次使用前需配置镜像加速器：
+
+```powershell
+# PowerShell（推荐）
+.\setup-docker-mirrors.ps1
+
+# 或 Git Bash / WSL / macOS / Linux
+bash setup-docker-mirrors.sh
+```
+
+支持 Windows (Docker Desktop)、macOS (Docker Desktop)、Linux (systemd)。已配置则自动跳过。若 PowerShell 提示执行策略限制，先运行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
 ### 一键部署（前后端）
 
 ```bash
@@ -151,9 +165,7 @@ docker run -d -p 3000:80 draftmind-frontend
 | npm 包 | 淘宝 npmmirror → 腾讯 → 华为 | npmjs.org 官方源 |
 | pip 包 | 阿里云 → 清华 TUNA | PyPI 官方源 |
 | Alpine 系统包 | 阿里云 mirrors | — |
-| Docker Hub | 建议在 `/etc/docker/daemon.json` 配置加速器 | — |
-
-运行 `bash docker-build.sh` 时会自动检测是否已配置 Docker Hub 加速器，未配置时给出提示。
+| Docker Hub | 腾讯 → 中科大 → 网易（自动写入 daemon.json） | — |
 
 ## 项目结构
 
@@ -170,6 +182,8 @@ DraftMind/
 ├── Dockerfile              # 多阶段生产构建（国内源 + 自动换源）
 ├── docker-compose.yml      # 前后端编排
 ├── docker-build.sh         # 构建脚本（含镜像源降级）
+├── setup-docker-mirrors.sh # Docker 镜像加速器配置 (Bash)
+├── setup-docker-mirrors.ps1 # Docker 镜像加速器配置 (PowerShell)
 ├── nginx.conf              # nginx 配置（SPA 路由 + API 反代）
 ├── .dockerignore           # Docker 构建排除规则
 ├── .env.production         # 生产环境变量

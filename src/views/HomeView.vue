@@ -165,6 +165,13 @@ const activeTab = ref('info')
 <style>
 .home-container {
   height: 100vh;
+  overflow: hidden;
+}
+.home-container > .el-aside {
+  overflow: hidden;
+}
+.home-container > .el-main {
+  overflow: hidden;
 }
 .aside {
   background-color: #f5f7fa;
