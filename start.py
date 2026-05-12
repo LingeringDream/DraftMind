@@ -3,7 +3,7 @@
 """
 DraftMind 跨平台统一启动脚本 (Win / Mac / Linux)
 
-一键启动 Flask 后端 + Vue.js (Vite) 前端开发服务器。
+一键启动 Django 后端 + Vue.js (Vite) 前端开发服务器。
 """
 import os
 import sys
@@ -65,7 +65,7 @@ def resolve_npm():
 
 
 def wait_for_backend(url=BACKEND_URL, timeout=BACKEND_TIMEOUT):
-    """轮询检测 Flask 后端是否就绪"""
+    """轮询检测 Django 后端是否就绪"""
     print(f"  Waiting for backend at {url} ...")
     start = time.time()
     while time.time() - start < timeout:
@@ -105,12 +105,16 @@ def main():
     python_exe = resolve_python()
     npm_exe = resolve_npm()
 
-    backend_file = os.path.join(os.getcwd(), "backend.py")
-    package_json = os.path.join(os.getcwd(), "package.json")
+    project_dir = os.getcwd()
+    manage_py = os.path.join(project_dir, "manage.py")
+    package_json = os.path.join(project_dir, "package.json")
 
     # --- 校验核心文件 ---
-    if not os.path.exists(backend_file):
-        raise FileNotFoundError("backend.py was not found.")
+    if not os.path.exists(manage_py):
+        raise FileNotFoundError(
+            "manage.py was not found in the project root. "
+            "Please ensure the Django backend is set up correctly."
+        )
     if npm_exe is None:
         raise FileNotFoundError(
             "npm was not found. Please install Node.js (>= 20.19) first.\n"
@@ -140,11 +144,22 @@ def main():
     frontend_proc = None
 
     try:
-        # --- 启动 Flask 后端 ---
-        print("[1/2] Starting Flask backend ...")
+        # --- 执行 Django 数据库迁移 ---
+        print("[0/2] Running Django migrations ...")
+        migrate_proc = subprocess.run(
+            [python_exe, manage_py, "migrate", "--run-syncdb"],
+            cwd=project_dir,
+        )
+        if migrate_proc.returncode != 0:
+            print("[ERROR] Django migrations failed.")
+            sys.exit(1)
+        print("  Database migrations applied.")
+
+        # --- 启动 Django 后端 ---
+        print("[1/2] Starting Django backend ...")
         backend_proc = subprocess.Popen(
-            [python_exe, backend_file],
-            cwd=os.getcwd(),
+            [python_exe, manage_py, "runserver", f"0.0.0.0:{BACKEND_PORT}", "--noreload"],
+            cwd=project_dir,
         )
 
         if not wait_for_backend():
