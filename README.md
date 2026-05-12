@@ -117,6 +117,56 @@ npm run dev
 
 启动成功后，访问 `http://localhost:5173` 即可使用 DraftMind。
 
+## Docker 部署
+
+### 前置：配置 Docker 镜像加速器（国内必做）
+
+Docker Hub 在国内访问受限，首次使用前需配置镜像加速器：
+
+```powershell
+# PowerShell（推荐）
+.\setup-docker-mirrors.ps1
+
+# 或 Git Bash / WSL / macOS / Linux
+bash setup-docker-mirrors.sh
+```
+
+支持 Windows (Docker Desktop)、macOS (Docker Desktop)、Linux (systemd)。已配置则自动跳过。若 PowerShell 提示执行策略限制，先运行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
+### 一键部署（前后端）
+
+```bash
+# 复制并编辑环境变量
+cp .env.example .env
+
+# 启动前后端
+docker compose up -d
+```
+
+前端访问 `http://localhost:3000`，后端 API 通过 nginx 反代自动转发。自定义端口在 `.env` 中设置 `FRONTEND_PORT` 和 `BACKEND_PORT`。
+
+### 仅前端部署
+
+```bash
+# 方式一：构建脚本（推荐，自动处理镜像源降级）
+bash docker-build.sh
+
+# 方式二：手动构建
+docker build -t draftmind-frontend .
+docker run -d -p 3000:80 draftmind-frontend
+```
+
+### 镜像源策略
+
+构建过程全程使用国内镜像源，网络故障时自动降级：
+
+| 层级 | 优先源 | 降级源 |
+|------|--------|--------|
+| npm 包 | 淘宝 npmmirror → 腾讯 → 华为 | npmjs.org 官方源 |
+| pip 包 | 阿里云 → 清华 TUNA | PyPI 官方源 |
+| Alpine 系统包 | 阿里云 mirrors | — |
+| Docker Hub | 腾讯 → 中科大 → 网易（自动写入 daemon.json） | — |
+
 ## 项目结构
 
 ```
@@ -129,6 +179,14 @@ DraftMind/
 ├── index.html              # 入口 HTML
 ├── package.json            # 前端依赖配置
 ├── vite.config.js          # Vite 构建配置
+├── Dockerfile              # 多阶段生产构建（国内源 + 自动换源）
+├── docker-compose.yml      # 前后端编排
+├── docker-build.sh         # 构建脚本（含镜像源降级）
+├── setup-docker-mirrors.sh # Docker 镜像加速器配置 (Bash)
+├── setup-docker-mirrors.ps1 # Docker 镜像加速器配置 (PowerShell)
+├── nginx.conf              # nginx 配置（SPA 路由 + API 反代）
+├── .dockerignore           # Docker 构建排除规则
+├── .env.production         # 生产环境变量
 ├── data/                   # 解析结果持久化目录（自动创建）
 ├── uploads/                # 本地图片存储目录（自动创建）
 ├── public/                 # 静态资源

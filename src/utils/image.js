@@ -1,7 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist'
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 
-// 使用 public 下的 worker 文件（绝对路径）
-pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
 export const pdfToImages = async (fileBytes, dpi = 150) => {
   const loadingTask = pdfjsLib.getDocument({ data: fileBytes })
