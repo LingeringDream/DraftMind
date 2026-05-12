@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
 ![Vue.js](https://img.shields.io/badge/Vue.js-3.5+-brightgreen.svg)
-![Flask](https://img.shields.io/badge/Flask-3.1+-green.svg)
+![Django](https://img.shields.io/badge/Django-5.2+-green.svg)
 
 ## 核心功能
 
@@ -20,11 +20,11 @@
 
 ## 系统架构
 
-系统采用前后端分离架构，前端基于 Vue.js 3 构建，后端使用 Flask 提供 RESTful API。
+系统采用前后端分离架构，前端基于 Vue.js 3 构建，后端使用 Django 提供 RESTful API，数据通过 Django ORM 持久化到 SQLite 数据库。
 
 ```
 ┌─────────────────┐     HTTP/JSON      ┌─────────────────────┐
-│   Vue.js 3      │ <---------------> │      Flask          │
+│   Vue.js 3      │ <---------------> │      Django         │
 │   前端 (Vite)    │                    │      后端 (API)       │
 │   Element Plus   │                    │      Python          │
 └─────────────────┘                    └─────────────────────┘
@@ -35,6 +35,7 @@
  上传图纸/提问/查看报告                   图片压缩 & base64编码
  选择图纸/调整参数                         调用阿里云通义千问API
                                          本地存储 / 阿里云OSS存储
+                                         Django ORM + SQLite 持久化
                                          管理向量知识库
 ```
 
@@ -99,23 +100,34 @@ VITE_API_BASE_URL=http://127.0.0.1:5000
 
 ### 4. 启动系统
 
-**方式一：统一启动脚本**
+**方式一：统一启动脚本（推荐）**
 
 ```bash
 python start.py
 ```
 
+该脚本会自动执行数据库迁移、启动 Django 后端和 Vite 前端开发服务器。
+
 **方式二：分别启动**
 
 ```bash
-# 启动后端
-python backend.py
+# 终端 1：启动后端（首次运行需先执行数据库迁移）
+python manage.py migrate
+python manage.py runserver 5000
 
-# 新终端，启动前端
+# 终端 2：启动前端
 npm run dev
 ```
 
 启动成功后，访问 `http://localhost:5173` 即可使用 DraftMind。
+
+### 5. 创建管理员账户（可选）
+
+```bash
+python manage.py createsuperuser
+```
+
+创建后可通过 `http://localhost:5000/admin/` 访问 Django 管理后台，直接查看和编辑数据库中的图纸、任务等记录。
 
 ## Docker 部署
 
@@ -171,52 +183,61 @@ docker run -d -p 3000:80 draftmind-frontend
 
 ```
 DraftMind/
-├── backend.py              # Flask 后端服务
-├── start.py                # 统一启动脚本
-├── main_prompt.md          # 图纸解析 System Prompt
-├── requirements.txt        # Python 依赖
-├── .env.example            # 环境变量示例
-├── index.html              # 入口 HTML
-├── package.json            # 前端依赖配置
-├── vite.config.js          # Vite 构建配置
-├── Dockerfile              # 多阶段生产构建（国内源 + 自动换源）
-├── docker-compose.yml      # 前后端编排
-├── docker-build.sh         # 构建脚本（含镜像源降级）
-├── setup-docker-mirrors.sh # Docker 镜像加速器配置 (Bash)
-├── setup-docker-mirrors.ps1 # Docker 镜像加速器配置 (PowerShell)
-├── nginx.conf              # nginx 配置（SPA 路由 + API 反代）
-├── .dockerignore           # Docker 构建排除规则
-├── .env.production         # 生产环境变量
-├── data/                   # 解析结果持久化目录（自动创建）
-├── uploads/                # 本地图片存储目录（自动创建）
-├── public/                 # 静态资源
-│   ├── logo.png
-│   └── pdf.worker.min.mjs  # PDF.js Worker
-└── src/
-    ├── api/                # API 请求封装
-    │   ├── client.js       # Axios 实例
-    │   ├── drawing.js      # 图纸相关接口
-    │   ├── job.js          # 任务状态接口
-    │   └── knowledge.js    # 知识库接口
-    ├── components/         # Vue 组件
-    │   ├── ChatPanel.vue   # 图纸问答面板
-    │   ├── DrawingInfo.vue # 图纸信息展示
-    │   ├── DrawingSidebar.vue # 图纸列表侧栏
-    │   ├── ReviewPanel.vue # 审查报告面板
-    │   ├── SimilarPanel.vue # 相似推荐面板
-    │   └── TaskProgress.vue # 任务进度条
-    ├── stores/             # Pinia 状态管理
-    │   └── drawing.js
-    ├── utils/
-    │   └── image.js        # 图像/PDF 处理工具
-    ├── views/
-    │   └── HomeView.vue    # 主页面
-    ├── App.vue
-    ├── main.js
-    └── router.js
+├── manage.py                   # Django 管理入口
+├── start.py                    # 统一启动脚本
+├── main_prompt.md              # 图纸解析 System Prompt
+├── requirements.txt            # Python 依赖
+├── .env.example                # 环境变量示例
+├── package.json                # 前端依赖配置
+├── vite.config.js              # Vite 构建配置
+├── Dockerfile                  # 多阶段生产构建（国内源 + 自动换源）
+├── docker-compose.yml          # 前后端编排
+│
+├── draftmind_backend/          # Django 项目配置
+│   ├── settings.py             # 集中配置（AI/OSS/CORS/数据库等）
+│   ├── urls.py                 # 根路由 + 媒体文件服务
+│   ├── wsgi.py                 # WSGI 入口
+│   └── asgi.py                 # ASGI 入口
+│
+├── drawings/                   # 图纸解析业务应用
+│   ├── models.py               # 数据库模型（会话/任务/文件/知识库）
+│   ├── views.py                # API 视图（10 个兼容端点）
+│   ├── services.py             # 业务逻辑（VLM/嵌入/存储/审查）
+│   ├── tasks.py                # 后台异步解析任务
+│   ├── urls.py                 # API 路由声明
+│   ├── admin.py                # Django 管理后台注册
+│   └── migrations/             # 数据库迁移文件
+│
+├── src/                        # Vue.js 前端
+│   ├── api/                    # API 请求封装
+│   │   ├── client.js           # Axios 实例
+│   │   ├── drawing.js          # 图纸相关接口
+│   │   ├── job.js              # 任务状态接口
+│   │   └── knowledge.js        # 知识库接口
+│   ├── components/             # Vue 组件
+│   │   ├── ChatPanel.vue       # 图纸问答面板
+│   │   ├── DrawingInfo.vue     # 图纸信息展示
+│   │   ├── DrawingSidebar.vue  # 图纸列表侧栏
+│   │   ├── ReviewPanel.vue     # 审查报告面板
+│   │   ├── SimilarPanel.vue    # 相似推荐面板
+│   │   └── TaskProgress.vue    # 任务进度条
+│   ├── stores/                 # Pinia 状态管理
+│   │   └── drawing.js
+│   ├── utils/
+│   │   └── image.js            # 图像/PDF 处理工具
+│   ├── views/
+│   │   └── HomeView.vue        # 主页面
+│   ├── App.vue
+│   ├── main.js
+│   └── router.js
+│
+├── uploads/                    # 本地图片存储目录（自动创建）
+└── db.sqlite3                  # SQLite 数据库文件（自动创建）
 ```
 
 ## API 接口
+
+所有接口与原 Flask 后端完全兼容，前端无需任何改动。
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
@@ -240,14 +261,15 @@ DraftMind/
 | **状态管理** | Pinia | Vue 3 官方状态管理方案 |
 | **路由** | Vue Router | 单页应用路由管理 |
 | **HTTP 客户端** | Axios | API 请求与拦截器 |
-| **后端** | Flask + flask-cors | 轻量级 Python Web 框架，支持跨域请求 |
+| **后端** | Django 5.2 + django-cors-headers | 全功能 Python Web 框架，内置 ORM、管理后台、迁移系统 |
+| **数据库** | SQLite（开发）/ PostgreSQL（生产） | Django ORM 管理，通过环境变量切换 |
 | **AI 模型** | 通义千问 (qwen3.6-plus, text-embedding-v3) | 多模态理解与文本嵌入 |
 | **存储** | 本地磁盘 / 阿里云 OSS | 图片默认本地存储，可选 OSS 云端存储 |
-| **数据持久化** | JSON 文件 | 解析结果保存到 `data/` 目录，重启后自动加载 |
+| **数据持久化** | Django ORM + SQLite | 解析结果、任务状态、知识库条目均通过 ORM 持久化 |
 | **图像处理** | Pillow, pdfjs-dist | 图像压缩、PDF 解析（浏览器端） |
 | **CAD 支持** | ezdxf, matplotlib | DXF 文件解析与渲染为图片 |
 | **HTTP 请求** | requests | 调用通义千问 API |
-| **向量计算** | numpy | 余弦相似度与尺寸相似度计算 |
+| **向量计算** | 纯 Python (math) | 余弦相似度与尺寸相似度计算 |
 | **环境管理** | python-dotenv | 加载 `.env` 配置文件 |
 
 ## 开发指南
@@ -266,6 +288,14 @@ npm run lint
 
 # 前端代码格式化
 npm run format
+
+# Django 数据库迁移
+python manage.py makemigrations
+python manage.py migrate
+
+# Django 管理后台
+python manage.py createsuperuser
+python manage.py runserver 5000
 ```
 
 ### 分支策略
