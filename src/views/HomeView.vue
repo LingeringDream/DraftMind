@@ -170,9 +170,6 @@ const activeTab = ref('info')
 .home-container > .el-aside {
   overflow: hidden;
 }
-.home-container > .el-main {
-  overflow: hidden;
-}
 .aside {
   background-color: #f5f7fa;
   border-right: 1px solid #e4e7ed;
