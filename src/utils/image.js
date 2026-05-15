@@ -1,7 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist'
 
-// 使用 public 下的 worker 文件（绝对路径）
-pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
+// 设置 worker 路径（确保 CDN 版本与包版本一致）
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
 
 export const pdfToImages = async (fileBytes, dpi = 150) => {
   const loadingTask = pdfjsLib.getDocument({ data: fileBytes })
@@ -35,13 +35,15 @@ export const imageToJpeg = (imgElement) => {
 }
 
 export const loadImageFromFile = (file) => {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
       const img = new Image()
       img.onload = () => resolve(img)
+      img.onerror = reject
       img.src = e.target.result
     }
+    reader.onerror = reject
     reader.readAsDataURL(file)
   })
 }

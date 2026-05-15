@@ -5,7 +5,7 @@
     </el-aside>
     <el-main>
       <TaskProgress />
-      
+
       <!-- 未解析任何图纸时显示上传区域 -->
       <div v-if="!store.currentInfo && !Object.keys(store.jobs).length">
         <el-upload
@@ -38,6 +38,17 @@
           <el-tab-pane label="图纸问答" name="chat">
             <ChatPanel />
           </el-tab-pane>
+          <!-- 新增 SVG 图纸标签页 -->
+          <el-tab-pane label="SVG 图纸" name="svg">
+            <SvgDrawingViewer
+              v-if="svgImageUrl"
+              :image-url="svgImageUrl"
+              :image-width="imageWidth"
+              :image-height="imageHeight"
+              :annotations-data="svgAnnotations"
+            />
+            <el-empty v-else description="当前图纸无底图数据，请重新上传解析" />
+          </el-tab-pane>
         </el-tabs>
       </div>
     </el-main>
@@ -64,7 +75,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'            // 只需导入 ref，不再需要 computed
+import { ref, computed } from 'vue'
 import { useDrawingStore } from '@/stores/drawing'
 import DrawingSidebar from '@/components/DrawingSidebar.vue'
 import TaskProgress from '@/components/TaskProgress.vue'
@@ -72,6 +83,7 @@ import DrawingInfo from '@/components/DrawingInfo.vue'
 import ReviewPanel from '@/components/ReviewPanel.vue'
 import SimilarPanel from '@/components/SimilarPanel.vue'
 import ChatPanel from '@/components/ChatPanel.vue'
+import SvgDrawingViewer from '@/components/SvgDrawingViewer.vue'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { pdfToImages, loadImageFromFile } from '@/utils/image'
@@ -123,6 +135,26 @@ const uploadAndParse = async () => {
 }
 
 const activeTab = ref('info')
+
+// 为 SVG 组件准备数据（基于当前图纸）
+const svgImageUrl = computed(() => {
+  const drawing = store.currentDrawing
+  if (drawing && drawing.images && drawing.images.length > 0) {
+    const img = drawing.images[0]
+    if (img instanceof HTMLImageElement) {
+      return img.src
+    } else if (img instanceof Blob) {
+      return URL.createObjectURL(img)
+    } else if (typeof img === 'string') {
+      return img
+    }
+  }
+  return null
+})
+
+const imageWidth = computed(() => store.currentDrawing?.imageDimensions?.width || 800)
+const imageHeight = computed(() => store.currentDrawing?.imageDimensions?.height || 600)
+const svgAnnotations = computed(() => store.currentDrawing?.svgAnnotations || { basic: [], dimensions: [], tolerances: [], gdt: [], roughness: [] })
 </script>
 
 <style>
